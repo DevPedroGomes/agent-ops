@@ -128,3 +128,35 @@ async def devolver(tipo: str, unidades: int = 1, escopo: str | None = None) -> N
         await r.incrby(_chave(tipo, escopo), -unidades)
     except Exception as exc:
         logger.error("metering.devolucao_falhou tipo=%s erro=%s", tipo, exc)
+
+
+async def panorama(limites: dict[str, int]) -> dict:
+    """Uso de hoje. Serve ao health check e a um selo na UI.
+
+    Recebe os limites em vez de le-los da configuracao: cada projeto tem os
+    proprios tipos de cota, e o pacote nao deve conhecer os nomes deles.
+
+    Nunca levanta. Um health check que quebra quando o Redis cai transforma
+    uma degradacao parcial em pagina fora do ar.
+    """
+    dia = _hoje_utc()
+    ligado = get_config().kill_switch
+
+    try:
+        r = await _redis()
+        usados = {
+            tipo: int(await r.get(_chave(tipo, dia=dia)) or 0) for tipo in limites
+        }
+    except Exception:
+        logger.warning("metering.panorama_degradado", exc_info=True)
+        return {"date": dia, "kill_switch": ligado, "degraded": True}
+
+    return {
+        "date": dia,
+        "kill_switch": ligado,
+        "used": usados,
+        "limits": limites,
+        # `max(0, ...)`: o teto e checado depois do INCR, entao o contador pode
+        # passar do limite por um instante. O selo publico nao mostra negativo.
+        "remaining": {t: max(0, limites[t] - usados[t]) for t in limites},
+    }

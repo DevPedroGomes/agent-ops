@@ -155,3 +155,40 @@ def test_devolver_engole_falha_do_redis(monkeypatch):
     monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
     # Nao levanta: uma devolucao perdida custa folga, nao dinheiro.
     asyncio.run(metering.devolver("chat"))
+
+
+def test_panorama_relata_uso_e_restante(redis_falso):
+    asyncio.run(metering.consumir("chat", limite=10, unidades=4))
+
+    p = asyncio.run(metering.panorama({"chat": 10, "ingest": 5}))
+
+    assert p["used"] == {"chat": 4, "ingest": 0}
+    assert p["limits"] == {"chat": 10, "ingest": 5}
+    assert p["remaining"] == {"chat": 6, "ingest": 5}
+    assert p["kill_switch"] is False
+    assert "degraded" not in p
+
+
+def test_panorama_nunca_reporta_restante_negativo(redis_falso):
+    # O teto e checado depois do INCR, entao o contador pode passar do limite
+    # por um instante. O selo publico nao pode mostrar "-1 restante".
+    asyncio.run(metering.consumir("chat", limite=100, unidades=7))
+
+    p = asyncio.run(metering.panorama({"chat": 5}))
+
+    assert p["remaining"]["chat"] == 0
+
+
+def test_panorama_degrada_sem_derrubar_o_health_check(monkeypatch):
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    get_config.cache_clear()
+
+    async def _quebrado():
+        return FakeRedis(explode=True)
+
+    monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
+
+    p = asyncio.run(metering.panorama({"chat": 10}))
+
+    assert p["degraded"] is True
+    assert p["kill_switch"] is False
