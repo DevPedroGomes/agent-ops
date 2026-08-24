@@ -22,6 +22,11 @@ class Config(BaseSettings):
     # dividindo o mesmo Redis dividiriam tambem o teto diario um do outro.
     projeto: str = "default"
 
+    # Teto de profundidade da fila. Acima disso a API recusa com 429 em vez de
+    # aceitar trabalho que nao va conseguir fazer — uma fila que so cresce e
+    # indistinguivel de um servico fora do ar, mas mente para o cliente.
+    profundidade_maxima: int = 500
+
     # Estanca gasto sem rebuild nem redeploy.
     kill_switch: bool = False
 
