@@ -172,3 +172,52 @@ def test_job_id_de_nomeia_o_job_mesmo_quando_enfileirar_deduplica():
 
     assert duplicado is None
     assert queue.job_id_de("abc", tenant="t1") == "brainhub:t1:abc"
+
+
+class PoolComFilaPropria:
+    """Pool criado com `create_pool(..., default_queue_name=...)`.
+
+    O `arq` deixa nomear a fila, e o `enqueue_job` respeita esse nome. Medir a
+    profundidade na fila padrao nesse caso le um sorted set sempre vazio.
+    """
+
+    default_queue_name = "arq:queue:ingestao"
+
+    def __init__(self, profundidade=0):
+        self.lidas: list[str] = []
+        self.enfileirados: list[tuple] = []
+        self._profundidade = profundidade
+
+    async def zcard(self, nome):
+        # So a fila nomeada tem conteudo. Ler qualquer outra chave devolve 0,
+        # que e exatamente o que o Redis responde para um sorted set que nao
+        # existe — e por isso a leitura errada passava despercebida.
+        self.lidas.append(nome)
+        return self._profundidade if nome == self.default_queue_name else 0
+
+    async def enqueue_job(self, funcao, *args, _job_id=None, **kwargs):
+        self.enfileirados.append((funcao, args, _job_id, kwargs))
+
+        class _Job:
+            job_id = _job_id
+
+        return _Job()
+
+
+def test_profundidade_le_a_fila_do_pool_e_nao_a_padrao():
+    pool = PoolComFilaPropria(profundidade=3)
+
+    assert asyncio.run(queue.profundidade(pool)) == 3
+    assert pool.lidas == ["arq:queue:ingestao"]
+
+
+def test_backpressure_vale_para_fila_nomeada():
+    # Lendo a fila padrao, esta profundidade seria 0 e o enfileirar aceitaria:
+    # a invariante 3 do spec (fila cheia recusa) pararia de valer em silencio
+    # para todo consumidor que nomeia a propria fila.
+    pool = PoolComFilaPropria(profundidade=500)
+
+    with pytest.raises(queue.FilaCheia):
+        asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t1"))
+
+    assert pool.enfileirados == []

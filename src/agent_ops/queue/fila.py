@@ -66,8 +66,18 @@ async def criar_pool() -> ArqRedis:
 
 
 async def profundidade(pool) -> int:
-    """Quantos jobs estao esperando. Levanta se o Redis nao responde."""
-    return await pool.zcard(default_queue_name)
+    """Quantos jobs estao esperando. Levanta se o Redis nao responde.
+
+    Le a fila DO POOL, nao a padrao: `create_pool(default_queue_name=...)` deixa
+    o consumidor nomear a propria fila e o `enqueue_job` respeita esse nome.
+    Medindo sempre `arq:queue`, um app com fila nomeada leria um sorted set
+    vazio, `enfileirar` nunca recusaria e a invariante 3 do spec (fila acima do
+    teto responde 429) deixaria de valer sem nenhum sinal.
+
+    `getattr` com fallback porque o parametro aceita qualquer objeto com
+    `zcard` — os dubles dos testes incluidos.
+    """
+    return await pool.zcard(getattr(pool, "default_queue_name", default_queue_name))
 
 
 async def enfileirar(
