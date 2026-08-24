@@ -248,3 +248,25 @@ def test_fila_cheia_de_verdade_nao_e_indisponibilidade():
         asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
 
     assert not isinstance(exc.value, queue.FilaIndisponivel)
+
+
+def test_tenant_e_digest_com_dois_pontos_sao_recusados():
+    # projeto="brainhub" + digest="b:c" produziria o mesmo id que
+    # projeto="brainhub" + tenant="b" + digest="c": o job de um tenant viraria
+    # o job de outro, que e exatamente o vazamento que o tenant fechou.
+    with pytest.raises(ValueError):
+        queue.fila._job_id("abc", tenant="acme:prod")
+
+    with pytest.raises(ValueError):
+        queue.fila._job_id("b:c")
+
+
+def test_enfileirar_recusa_tenant_ambiguo():
+    pool = FakePool()
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            queue.enfileirar(pool, "processar", digest="abc", tenant="acme:prod")
+        )
+
+    assert pool.enfileirados == []

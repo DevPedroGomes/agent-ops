@@ -33,7 +33,11 @@ from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 
-from agent_ops.config import get_config, kill_switch_ligado
+from agent_ops.config import (
+    exigir_sem_dois_pontos,
+    get_config,
+    kill_switch_ligado,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,18 @@ def _hoje_utc() -> str:
 
 
 def _chave(tipo: str, escopo: str | None = None, dia: str | None = None) -> str:
+    """Monta a chave do contador. Recusa `:` dentro de `tipo`.
+
+    Sem essa recusa, `_chave("a", escopo="b")` e `_chave("a:b")` produziam a
+    MESMA chave: um teto por IP passaria a somar no contador de outro tipo de
+    cota, sem erro nenhum.
+
+    `escopo` fica livre de proposito: ele e o ULTIMO pedaco da chave, entao um
+    `:` la dentro nao cria ambiguidade — e o caso de uso documentado do escopo
+    e justamente `ip:1.2.3.4`. Barrar `tipo` (vocabulario pequeno e escolhido
+    pela app: "chat", "ingest") fecha a colisao sem tirar isso.
+    """
+    exigir_sem_dois_pontos(tipo, "tipo")
     base = f"ao:budget:{get_config().projeto}:{dia or _hoje_utc()}:{tipo}"
     return f"{base}:{escopo}" if escopo else base
 

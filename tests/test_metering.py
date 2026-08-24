@@ -355,3 +355,18 @@ def test_devolver_recusa_unidades_nao_positiva(redis_falso):
             asyncio.run(metering.devolver("chat", unidades=invalida))
 
     assert redis_falso.valores[metering.cotas._chave("chat")] == 2
+
+
+def test_tipo_com_dois_pontos_e_recusado(redis_falso):
+    # `_chave("a", escopo="b")` e `_chave("a:b")` davam a MESMA chave: um teto
+    # por IP passava a somar no contador de outro tipo de cota, sem erro.
+    with pytest.raises(ValueError):
+        metering.cotas._chave("chat:ip")
+
+
+def test_escopo_pode_ter_dois_pontos(redis_falso):
+    # `escopo` e o ULTIMO pedaco da chave, entao `:` la dentro nao cria
+    # ambiguidade — e `ip:1.2.3.4` e justamente o uso documentado dele.
+    assert metering.cotas._chave("chat", escopo="ip:1.2.3.4", dia="2026-08-24") == (
+        "ao:budget:testes:2026-08-24:chat:ip:1.2.3.4"
+    )

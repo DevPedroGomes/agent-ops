@@ -6,6 +6,9 @@ para quebrar, porque import com efeito colateral transforma `pytest --collect`
 e o `--help` da app em chamada de rede.
 """
 
+import pytest
+from pydantic import ValidationError
+
 import agent_ops
 from agent_ops.config import Config, get_config
 
@@ -44,3 +47,20 @@ def test_o_kill_switch_do_teste_anterior_nao_vazou():
     # Sem o autouse do conftest, o lru_cache de get_config atravessaria a
     # fronteira entre os dois testes e este leria True.
     assert get_config().kill_switch is False
+
+
+def test_projeto_com_dois_pontos_e_recusado(monkeypatch):
+    # `:` e o separador das chaves e dos job ids, e as juntas nao escapam nada:
+    # projeto="a:b" + digest="c" produz o mesmo id que projeto="a" +
+    # tenant="b" + digest="c". Colisao de chave aqui nao levanta erro nenhum —
+    # ela mistura o teto de dois projetos e entrega a um tenant o job do outro.
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "a:b")
+
+    with pytest.raises(ValidationError):
+        get_config()
+
+
+def test_projeto_sem_dois_pontos_continua_valendo(monkeypatch):
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "brainhub")
+
+    assert get_config().projeto == "brainhub"

@@ -19,9 +19,17 @@ hospedeira.
 | Env | Padrão | Para quê |
 |---|---|---|
 | `AGENT_OPS_REDIS_URL` | `redis://localhost:6379` | Metering e fila |
-| `AGENT_OPS_PROJETO` | `default` | Namespaceia chaves e job ids |
+| `AGENT_OPS_PROJETO` | `default` | Namespaceia chaves e job ids (sem `:`) |
 | `AGENT_OPS_KILL_SWITCH` | `true`/`false` | Estanca gasto (ver abaixo) |
 | `AGENT_OPS_PROFUNDIDADE_MAXIMA` | `500` | Teto da fila antes do 429 |
+
+`:` é o separador das chaves do Redis e dos job ids, e as juntas não escapam
+nada. Por isso `AGENT_OPS_PROJETO`, o `tipo` da cota e o `tenant`/`digest` do
+job **não podem conter `:`** — `projeto="a:b"` + `digest="c"` produziria o mesmo
+id que `projeto="a"` + `tenant="b"` + `digest="c"`, e colisão de chave aqui não
+levanta erro: mistura o teto de dois projetos ou entrega a um tenant o job do
+outro. O `escopo` do metering é a exceção proposital — é o último pedaço da
+chave, então `ip:1.2.3.4` continua valendo.
 
 ## `metering` — teto de gasto
 

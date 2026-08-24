@@ -26,7 +26,7 @@ from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
 from arq.constants import default_queue_name
 
-from agent_ops.config import get_config
+from agent_ops.config import exigir_sem_dois_pontos, get_config
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,21 @@ class FilaIndisponivel(FilaCheia):
 
 
 def _job_id(digest: str, tenant: str | None = None) -> str:
+    """`projeto:tenant:digest`, ou `projeto:digest` sem tenant.
+
+    Os tres pedacos sao barrados contra `:` porque a junta nao escapa nada e o
+    id tem numero variavel de campos: `projeto="a"` + `digest="b:c"` produziria
+    exatamente o mesmo id que `projeto="a"` + `tenant="b"` + `digest="c"`, e o
+    job de um tenant viraria o job de outro — o mesmo vazamento que o `tenant`
+    entrou aqui para fechar. `digest` vem de `decisions.digerir` (hex de
+    SHA-256), entao a checagem so pega quem inventou um identificador proprio.
+    """
     projeto = get_config().projeto
-    return f"{projeto}:{tenant}:{digest}" if tenant else f"{projeto}:{digest}"
+    exigir_sem_dois_pontos(digest, "digest")
+    if tenant is None:
+        return f"{projeto}:{digest}"
+    exigir_sem_dois_pontos(tenant, "tenant")
+    return f"{projeto}:{tenant}:{digest}"
 
 
 def job_id_de(digest: str, tenant: str | None = None) -> str:
