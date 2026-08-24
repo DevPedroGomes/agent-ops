@@ -22,3 +22,4 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "agent_ops.decisions" = ["*.sql"]
+"agent_ops.queue" = ["*.sql"]
