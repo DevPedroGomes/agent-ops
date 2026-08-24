@@ -11,6 +11,7 @@ O que se prende aqui:
 """
 
 import json
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -114,3 +115,22 @@ def test_evidence_e_outcome_vazios_viram_json_vazio(engine):
 
     assert json.loads(linha.evidence) == {}
     assert json.loads(linha.outcome) == {}
+
+
+def test_evidencia_nao_serializavel_nao_derruba_o_chamador(engine):
+    # O gatilho mais realista do contrato "nunca levanta" nao e o banco cair:
+    # e alguem montar a evidencia com um `datetime`, um `set` ou um objeto de
+    # modelo, e `json.dumps` levantar TypeError. Hoje a serializacao esta
+    # dentro do `try`, entao passa. Mas se um dia alguem mover a montagem do
+    # dict para fora — por exemplo para encurtar a transacao — o contrato
+    # quebra em silencio, e este teste e a unica coisa que avisa.
+    resultado = registro.registrar(
+        engine,
+        tenant_id="t1",
+        correlation_id="e",
+        input_digest="d",
+        rule_code="R",
+        evidence={"quando": datetime(2026, 8, 24, 12, 0, 0)},
+    )
+
+    assert resultado is None
