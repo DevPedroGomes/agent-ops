@@ -20,7 +20,7 @@ hospedeira.
 |---|---|---|
 | `AGENT_OPS_REDIS_URL` | `redis://localhost:6379` | Metering e fila |
 | `AGENT_OPS_PROJETO` | `default` | Namespaceia chaves e job ids |
-| `AGENT_OPS_KILL_SWITCH` | `false` | Estanca gasto sem redeploy |
+| `AGENT_OPS_KILL_SWITCH` | `true`/`false` | Estanca gasto (ver abaixo) |
 | `AGENT_OPS_PROFUNDIDADE_MAXIMA` | `500` | Teto da fila antes do 429 |
 
 ## `metering` — teto de gasto
@@ -50,6 +50,31 @@ ilegível não é um teto ausente.
 `Retry-After` faz sentido) de "o backend não pôde ser lido" (503, e nenhum prazo
 prometido ao cliente conserta). O kill switch é parada **deliberada**, não falha
 de backend: continua `TetoAtingido` puro.
+
+### Kill switch
+
+`AGENT_OPS_KILL_SWITCH=true` faz `consumir` recusar **antes** de tocar no Redis.
+Ele é lido a cada chamada, não no boot: dá para ligar no container em pé
+(`docker compose exec` não serve — a env precisa entrar no processo; na prática
+é `AGENT_OPS_KILL_SWITCH=true docker compose up -d web worker`, que recria os
+contêineres em segundos **sem rebuild de imagem e sem redeploy**). O restante
+da configuração (`REDIS_URL`, `PROJETO`) continua sendo lido uma vez por
+processo, porque não muda com o serviço no ar.
+
+### `panorama` — health check e selo de uso
+
+```python
+p = await metering.panorama({"chat": 300, "ingest": 50})
+# {"date": "2026-08-24", "kill_switch": False, "degraded": False,
+#  "used": {...}, "limits": {...}, "remaining": {...}}
+```
+
+`panorama` **nunca levanta** — um health check que quebra quando o Redis cai
+transforma degradação parcial em página fora do ar. Quando o Redis não responde
+ele devolve o mesmo formato com `degraded: True` e os contadores zerados, então
+`p["remaining"]["chat"]` é seguro nos dois casos. Mostre o selo apenas quando
+`degraded` for `False`: com o Redis fora, os zeros não significam "cota livre",
+significam "não sei".
 
 ## `decisions` — trilha auditável
 

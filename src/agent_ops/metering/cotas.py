@@ -16,7 +16,10 @@ Decisoes, todas herdadas do `budget.py` do BrainHub:
 - Se o Redis nao responde, RECUSA. Um teto ilegivel nao e um teto ausente —
   mas o tipo levantado e `TetoIndisponivel`, para o chamador separar 503 de 429.
 - O kill switch e configuracao de ambiente, para estancar sem redeploy. Ele e
-  parada deliberada, nao falha de backend: continua `TetoAtingido` puro.
+  parada deliberada, nao falha de backend: continua `TetoAtingido` puro. E lido
+  a CADA chamada (`kill_switch_ligado`), nao pelo cache de `get_config` — um
+  freio de emergencia que so pega depois de reiniciar o processo nao e freio de
+  emergencia.
 
 O que mudou na extracao: a chave ganhou `projeto` (dois apps no mesmo Redis
 dividiriam o teto um do outro) e `escopo` opcional (teto por IP convivendo com
@@ -30,7 +33,7 @@ from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
 
-from agent_ops.config import get_config
+from agent_ops.config import get_config, kill_switch_ligado
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +94,7 @@ async def consumir(
     ilegivel, o tipo e `TetoIndisponivel` (subclasse), para o chamador poder
     responder 503 em vez de 429 sem inspecionar a mensagem.
     """
-    if get_config().kill_switch:
+    if kill_switch_ligado():
         logger.warning("metering.kill_switch_ativo tipo=%s", tipo)
         raise TetoAtingido("This demo is paused right now. Please try again later.")
 
@@ -158,7 +161,9 @@ async def panorama(limites: dict[str, int]) -> dict:
     uma degradacao parcial em pagina fora do ar.
     """
     dia = _hoje_utc()
-    ligado = get_config().kill_switch
+    # Leitura viva, a mesma que o `consumir` usa: o health check nao pode dizer
+    # "kill switch desligado" enquanto o `consumir` ja esta recusando por ele.
+    ligado = kill_switch_ligado()
 
     try:
         r = await _redis()

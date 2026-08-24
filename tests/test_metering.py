@@ -129,14 +129,21 @@ def test_redis_ilegivel_recusa(monkeypatch):
 
 def test_kill_switch_recusa_antes_de_tocar_no_redis(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
+    tocou = []
 
     async def _explode():
+        # Registrar a passagem e obrigatorio: o `except` generico do `consumir`
+        # converteria a excecao deste duble em TetoAtingido, e o teste passaria
+        # mesmo com o kill switch desligado.
+        tocou.append(True)
         raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
 
     monkeypatch.setattr(metering.cotas, "_redis", _explode)
 
     with pytest.raises(metering.TetoAtingido):
         asyncio.run(metering.consumir("chat", limite=10))
+
+    assert tocou == [], "o kill switch nao barrou: a chamada chegou no Redis"
 
 
 def test_devolver_reduz_o_contador(redis_falso):
@@ -233,12 +240,63 @@ def test_kill_switch_nao_e_indisponibilidade(monkeypatch):
     # operador desligou a demo. Continua 429, nao 503.
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
 
-    async def _explode():
-        raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
+    tocou = []
 
-    monkeypatch.setattr(metering.cotas, "_redis", _explode)
+    async def _registra():
+        tocou.append(True)
+        return FakeRedis()
+
+    monkeypatch.setattr(metering.cotas, "_redis", _registra)
 
     with pytest.raises(metering.TetoAtingido) as exc:
         asyncio.run(metering.consumir("chat", limite=10))
 
+    assert tocou == [], "o kill switch nao barrou: a chamada chegou no Redis"
     assert not isinstance(exc.value, metering.TetoIndisponivel)
+
+
+def test_kill_switch_engaja_sem_reiniciar_o_processo(monkeypatch):
+    # O operador liga a env no container EM PE e espera o gasto parar. Como
+    # `get_config` e lru_cache, a leitura ficava congelada na primeira chamada
+    # e o switch so valia depois de reiniciar — enquanto config.py e o README
+    # prometiam "sem rebuild nem redeploy". E o freio de emergencia: o prazo
+    # documentado dele nao pode estar errado.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    assert get_config().kill_switch is False  # config carregada e congelada
+
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")  # sem cache_clear
+    tocou = []
+
+    async def _explode():
+        tocou.append(True)
+        raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
+
+    monkeypatch.setattr(metering.cotas, "_redis", _explode)
+
+    with pytest.raises(metering.TetoAtingido):
+        asyncio.run(metering.consumir("chat", limite=10))
+
+    assert tocou == [], "o kill switch nao barrou: a chamada chegou no Redis"
+
+
+def test_panorama_relata_o_kill_switch_vivo(monkeypatch):
+    # O health check nao pode dizer "kill switch desligado" enquanto o consumir
+    # ja esta recusando por causa dele.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    assert get_config().kill_switch is False
+
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
+
+    async def _quebrado():
+        return FakeRedis(explode=True)
+
+    monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
+
+    assert asyncio.run(metering.panorama({"chat": 10}))["kill_switch"] is True
+
+
+def test_kill_switch_sem_env_cai_no_valor_da_config():
+    # Sem a env definida, vale o que a Config carregou (default False).
+    from agent_ops.config import kill_switch_ligado
+
+    assert kill_switch_ligado() is False
