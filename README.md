@@ -111,6 +111,8 @@ decisions.registrar(
 ### Antes de tudo: aplicar o schema
 
 ```python
+from agent_ops import decisions, queue
+
 queue.aplicar_schema(engine)          # idempotente, roda no boot
 decisions.migracao.aplicar(engine)    # idem
 ```
@@ -200,6 +202,21 @@ chamar a função**. Com `max_tries = 3` no worker e `queue.esgotou` valendo 5, 
 tentativa que chamaria `descartar` nunca executa: nada vai para a dead-letter e
 o job some da UI de operação — que é a única razão de `descartado` existir.
 Amarrar os dois pela constante fecha isso por construção.
+
+Lado que lê o progresso (o handler do SSE):
+
+```python
+p = queue.ler(engine, job_id)
+# None            -> nunca foi marcado (ou a leitura falhou; veja o log)
+# p["estado"]     -> pendente | rodando | concluido | falhou | descartado
+# p["percentual"] -> preservado no dead-letter: um job morto aos 80% mostra 80%
+# p["detalhe"]    -> a frase que a UI mostra
+# p["atualizado"] -> quando mudou pela última vez
+```
+
+Olhe `atualizado`. Sem ele, um job `rodando` há dez segundos e um job `rodando`
+desde que o worker levou SIGKILL há uma hora são a mesma leitura — e é a segunda
+situação que alguém precisa enxergar.
 
 ### Limite da deduplicação: ela tem prazo
 

@@ -4,6 +4,10 @@ Prefixo `AGENT_OPS_` para nao colidir com as envs da app hospedeira: o BrainHub
 ja tem `REDIS_URL` propria e as duas podem apontar para instancias diferentes.
 
 `extra="ignore"` porque a app hospedeira tem dezenas de envs que nao sao nossas.
+
+O cache vale para o que nao muda com o servico no ar. O kill switch NAO e um
+desses: ele tem funcao propria, `kill_switch_ligado()`, que le a env a cada
+chamada — ver o docstring dela.
 """
 
 from __future__ import annotations
@@ -52,15 +56,16 @@ class Config(BaseSettings):
     # indistinguivel de um servico fora do ar, mas mente para o cliente.
     profundidade_maxima: int = 500
 
+    # Estanca gasto sem rebuild de imagem e sem deploy de codigo: basta a env
+    # chegar ao processo. Guardado aqui para valer de default quando ela nao
+    # esta definida, mas quem MANDA e `kill_switch_ligado()` — este campo
+    # congela na primeira leitura, e um freio de emergencia congelado nao freia.
+    kill_switch: bool = False
+
     @field_validator("projeto")
     @classmethod
     def _projeto_sem_dois_pontos(cls, valor: str) -> str:
         return exigir_sem_dois_pontos(valor, "AGENT_OPS_PROJETO")
-
-    # Estanca gasto sem rebuild nem redeploy. Guardado aqui para o `panorama`
-    # ter um default quando a env nao esta definida, mas quem MANDA e
-    # `kill_switch_ligado()`: este campo congela na primeira leitura.
-    kill_switch: bool = False
 
 
 @lru_cache(maxsize=1)

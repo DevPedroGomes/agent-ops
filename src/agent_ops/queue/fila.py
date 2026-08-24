@@ -72,8 +72,9 @@ class FilaIndisponivel(FilaCheia):
 def _job_id(digest: str, tenant: str | None = None) -> str:
     """`projeto:tenant:digest`, ou `projeto:digest` sem tenant.
 
-    Os tres pedacos sao barrados contra `:` porque a junta nao escapa nada e o
-    id tem numero variavel de campos: `projeto="a"` + `digest="b:c"` produziria
+    Nenhum dos tres pedacos pode conter `:` — `projeto` e barrado pelo validator
+    da `Config`, `tenant` e `digest` aqui. A junta nao escapa nada e o id tem
+    numero variavel de campos: `projeto="a"` + `digest="b:c"` produziria
     exatamente o mesmo id que `projeto="a"` + `tenant="b"` + `digest="c"`, e o
     job de um tenant viraria o job de outro — o mesmo vazamento que o `tenant`
     entrou aqui para fechar. `digest` vem de `decisions.digerir` (hex de
