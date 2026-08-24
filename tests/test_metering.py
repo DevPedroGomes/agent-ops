@@ -192,3 +192,60 @@ def test_panorama_degrada_sem_derrubar_o_health_check(monkeypatch):
 
     assert p["degraded"] is True
     assert p["kill_switch"] is False
+
+
+def test_redis_ilegivel_levanta_o_subtipo_de_indisponibilidade(monkeypatch):
+    # "Voce esgotou o teto" e "o Redis caiu" sao 429 e 503. Com um tipo so, o
+    # chamador respondia 429 para uma queda de infra e mandava o visitante
+    # tentar de novo em 30s — prazo que nao conserta uma indisponibilidade.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    get_config.cache_clear()
+
+    async def _quebrado():
+        return FakeRedis(explode=True)
+
+    monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
+
+    with pytest.raises(metering.TetoIndisponivel):
+        asyncio.run(metering.consumir("chat", limite=10))
+
+
+def test_teto_indisponivel_continua_sendo_pego_por_teto_atingido(monkeypatch):
+    # Compatibilidade: quem ja escreve `except TetoAtingido` nao pode passar a
+    # deixar a excecao subir depois desta mudanca.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    get_config.cache_clear()
+
+    async def _quebrado():
+        return FakeRedis(explode=True)
+
+    monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
+
+    with pytest.raises(metering.TetoAtingido):
+        asyncio.run(metering.consumir("chat", limite=10))
+
+
+def test_teto_esgotado_nao_e_indisponibilidade(redis_falso):
+    asyncio.run(metering.consumir("chat", limite=1))
+
+    with pytest.raises(metering.TetoAtingido) as exc:
+        asyncio.run(metering.consumir("chat", limite=1))
+
+    assert not isinstance(exc.value, metering.TetoIndisponivel)
+
+
+def test_kill_switch_nao_e_indisponibilidade(monkeypatch):
+    # O kill switch e uma parada DELIBERADA, nao uma falha de backend: o
+    # operador desligou a demo. Continua 429, nao 503.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
+    get_config.cache_clear()
+
+    async def _explode():
+        raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
+
+    monkeypatch.setattr(metering.cotas, "_redis", _explode)
+
+    with pytest.raises(metering.TetoAtingido) as exc:
+        asyncio.run(metering.consumir("chat", limite=10))
+
+    assert not isinstance(exc.value, metering.TetoIndisponivel)

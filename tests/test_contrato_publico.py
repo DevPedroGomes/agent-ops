@@ -16,7 +16,9 @@ import sys
 def test_metering_expoe_os_nomes_que_o_brainhub_usa():
     import agent_ops.metering as m
 
-    for nome in ("consumir", "devolver", "panorama", "TetoAtingido"):
+    for nome in (
+        "consumir", "devolver", "panorama", "TetoAtingido", "TetoIndisponivel",
+    ):
         assert hasattr(m, nome), f"faltou {nome} na superficie publica"
 
 
@@ -30,7 +32,10 @@ def test_decisions_expoe_registrar_e_digerir():
 def test_queue_expoe_enfileirar_e_progresso():
     import agent_ops.queue as q
 
-    for nome in ("enfileirar", "FilaCheia", "marcar", "ler", "descartar"):
+    for nome in (
+        "enfileirar", "job_id_de", "FilaCheia", "FilaIndisponivel",
+        "marcar", "ler", "descartar",
+    ):
         assert hasattr(q, nome), f"faltou {nome} na superficie publica"
 
 

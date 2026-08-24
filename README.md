@@ -30,6 +30,8 @@ from agent_ops import metering
 
 try:
     restante = await metering.consumir("chat", limite=300)
+except metering.TetoIndisponivel as e:      # subclasse: vem ANTES
+    return JSONResponse({"error": e.mensagem}, status_code=503)
 except metering.TetoAtingido as e:
     return JSONResponse({"error": e.mensagem}, status_code=429)
 
@@ -42,6 +44,12 @@ except Exception:
 
 A cota é consumida **antes** da chamada paga. Redis ilegível recusa: um teto
 ilegível não é um teto ausente.
+
+`TetoIndisponivel` é subclasse de `TetoAtingido`, então quem só escreve
+`except TetoAtingido` continua funcionando. Ela separa "acabou a cota" (429, e
+`Retry-After` faz sentido) de "o backend não pôde ser lido" (503, e nenhum prazo
+prometido ao cliente conserta). O kill switch é parada **deliberada**, não falha
+de backend: continua `TetoAtingido` puro.
 
 ## `decisions` — trilha auditável
 
@@ -80,6 +88,8 @@ try:
         digest=digest,
         tenant=user_id,          # SEMPRE, num app multi-tenant — ver abaixo
     )
+except queue.FilaIndisponivel as e:      # subclasse: vem ANTES
+    return JSONResponse({"error": e.mensagem}, status_code=503)
 except queue.FilaCheia as e:
     return JSONResponse(
         {"error": e.mensagem},

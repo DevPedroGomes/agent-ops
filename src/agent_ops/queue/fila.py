@@ -13,7 +13,9 @@ a profundidade sem varrer nada. Acima do teto a API recusa com 429 e
 ar, com o agravante de mentir para o cliente que o trabalho foi aceito.
 
 REDIS ILEGIVEL RECUSA, mesma invariante do metering: nao da para afirmar que ha
-espaco na fila sem conseguir ler a fila.
+espaco na fila sem conseguir ler a fila. O tipo levantado nesse caso e
+`FilaIndisponivel`, subclasse de `FilaCheia`, para o chamador separar 503 de 429
+sem comparar mensagem.
 """
 
 from __future__ import annotations
@@ -33,12 +35,29 @@ _RETRY_AFTER_SEGUNDOS = 30
 
 
 class FilaCheia(Exception):
-    """Recusa segura de mostrar ao visitante, com dica de quando voltar."""
+    """Recusa segura de mostrar ao visitante, com dica de quando voltar.
+
+    O chamador responde 429 com `Retry-After: retry_after`.
+    """
 
     def __init__(self, mensagem: str, retry_after: int = _RETRY_AFTER_SEGUNDOS):
         self.mensagem = mensagem
         self.retry_after = retry_after
         super().__init__(mensagem)
+
+
+class FilaIndisponivel(FilaCheia):
+    """Recusa porque a fila nao pode ser LIDA, nao porque encheu.
+
+    Subclasse e nao irma: `except FilaCheia` ja escrito continua pegando esta,
+    entao a distincao pode ser adotada aos poucos.
+
+    Existe porque "a fila encheu" e "o Redis caiu" sao 429 e 503, e ate aqui o
+    unico jeito de separar os dois era comparar a mensagem em ingles. Um 429
+    com `Retry-After: 30` para uma queda de infra promete ao cliente um prazo
+    que nao depende dele, e nao acorda ninguem de plantao. Quem quiser um prazo
+    diferente para a queda passa outro `retry_after` ao tratar este tipo.
+    """
 
 
 def _job_id(digest: str, tenant: str | None = None) -> str:
@@ -107,14 +126,15 @@ async def enfileirar(
     `tenant` fica opcional (e por ultimo) para nao quebrar quem ja chama sem
     ele; omitido, o id mantem o formato antigo `projeto:digest`.
 
-    Levanta `FilaCheia` quando a fila passou do teto ou nao pode ser lida.
+    Levanta `FilaCheia` quando a fila passou do teto e `FilaIndisponivel`
+    (subclasse) quando a fila nao pode ser lida — 429 e 503, respectivamente.
     """
     teto = get_config().profundidade_maxima
     try:
         atual = await profundidade(pool)
     except Exception as exc:
         logger.error("queue.profundidade_ilegivel erro=%s", exc)
-        raise FilaCheia("The queue is temporarily unavailable.") from exc
+        raise FilaIndisponivel("The queue is temporarily unavailable.") from exc
 
     if atual >= teto:
         logger.warning("queue.cheia atual=%d teto=%d", atual, teto)

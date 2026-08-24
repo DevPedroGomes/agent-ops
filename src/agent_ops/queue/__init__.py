@@ -13,6 +13,7 @@ from agent_ops.queue.execucao import (
 )
 from agent_ops.queue.fila import (
     FilaCheia,
+    FilaIndisponivel,
     criar_pool,
     enfileirar,
     job_id_de,
@@ -21,7 +22,8 @@ from agent_ops.queue.fila import (
 
 __all__ = [
     "fila", "execucao",
-    "FilaCheia", "criar_pool", "enfileirar", "job_id_de", "profundidade",
+    "FilaCheia", "FilaIndisponivel",
+    "criar_pool", "enfileirar", "job_id_de", "profundidade",
     "ESTADOS", "aplicar_schema", "backoff", "descartar", "esgotou",
     "ler", "marcar", "tentar_de_novo",
 ]

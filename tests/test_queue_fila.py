@@ -221,3 +221,30 @@ def test_backpressure_vale_para_fila_nomeada():
         asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t1"))
 
     assert pool.enfileirados == []
+
+
+def test_redis_ilegivel_levanta_o_subtipo_de_indisponibilidade():
+    # "A fila esta cheia" e "nao da para ler a fila" sao 429 e 503. Com um tipo
+    # so, o chamador respondia 429 para uma queda de infra.
+    pool = FakePool(explode=True)
+
+    with pytest.raises(queue.FilaIndisponivel):
+        asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
+
+
+def test_fila_indisponivel_continua_sendo_pega_por_fila_cheia():
+    # Compatibilidade: quem ja escreve `except FilaCheia` nao pode passar a
+    # deixar a excecao subir depois desta mudanca.
+    pool = FakePool(explode=True)
+
+    with pytest.raises(queue.FilaCheia):
+        asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
+
+
+def test_fila_cheia_de_verdade_nao_e_indisponibilidade():
+    pool = FakePool(profundidade=500)
+
+    with pytest.raises(queue.FilaCheia) as exc:
+        asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
+
+    assert not isinstance(exc.value, queue.FilaIndisponivel)

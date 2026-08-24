@@ -13,8 +13,10 @@ Decisoes, todas herdadas do `budget.py` do BrainHub:
 - INCR primeiro e checa depois: duas requisicoes concorrentes enxergam cada uma
   o proprio total pos-incremento, entao nenhuma escapa do teto. Quem perde
   desfaz o proprio incremento.
-- Se o Redis nao responde, RECUSA. Um teto ilegivel nao e um teto ausente.
-- O kill switch e configuracao de ambiente, para estancar sem redeploy.
+- Se o Redis nao responde, RECUSA. Um teto ilegivel nao e um teto ausente —
+  mas o tipo levantado e `TetoIndisponivel`, para o chamador separar 503 de 429.
+- O kill switch e configuracao de ambiente, para estancar sem redeploy. Ele e
+  parada deliberada, nao falha de backend: continua `TetoAtingido` puro.
 
 O que mudou na extracao: a chave ganhou `projeto` (dois apps no mesmo Redis
 dividiriam o teto um do outro) e `escopo` opcional (teto por IP convivendo com
@@ -39,11 +41,25 @@ _TTL_SEGUNDOS = 172_800
 
 
 class TetoAtingido(Exception):
-    """Recusa segura de mostrar ao visitante."""
+    """Recusa segura de mostrar ao visitante. O chamador responde 429."""
 
     def __init__(self, mensagem: str):
         self.mensagem = mensagem
         super().__init__(mensagem)
+
+
+class TetoIndisponivel(TetoAtingido):
+    """Recusa porque o teto nao pode ser LIDO, nao porque acabou.
+
+    Subclasse e nao irma: `except TetoAtingido` ja escrito continua pegando
+    esta, entao a distincao pode ser adotada aos poucos.
+
+    Existe porque "voce esgotou a cota de hoje" e "o Redis caiu" sao 429 e 503,
+    e ate aqui o unico jeito de separar os dois era comparar a mensagem em
+    ingles. Todo chamador respondia 429 para uma queda de infra e mandava o
+    visitante voltar em 30s — prazo que nao conserta indisponibilidade, e
+    status que nao acorda ninguem de plantao.
+    """
 
 
 def _hoje_utc() -> str:
@@ -71,7 +87,9 @@ async def consumir(
     """Gasta `unidades` da cota de hoje. Devolve o quanto sobrou.
 
     Levanta `TetoAtingido` sem ter consumido nada — uma chamada recusada nao
-    custa cota ao proximo visitante.
+    custa cota ao proximo visitante. Quando a recusa vem de o Redis estar
+    ilegivel, o tipo e `TetoIndisponivel` (subclasse), para o chamador poder
+    responder 503 em vez de 429 sem inspecionar a mensagem.
     """
     if get_config().kill_switch:
         logger.warning("metering.kill_switch_ativo tipo=%s", tipo)
@@ -84,7 +102,7 @@ async def consumir(
     except Exception as exc:
         # Falhou ANTES de contar: nao ha incremento para desfazer.
         logger.error("metering.estado_ilegivel tipo=%s erro=%s", tipo, exc)
-        raise TetoAtingido("This demo is temporarily unavailable.") from exc
+        raise TetoIndisponivel("This demo is temporarily unavailable.") from exc
 
     if usado == unidades:
         # O TTL e faxina, nao corretude: o contador ja esta certo sem ele, e a
