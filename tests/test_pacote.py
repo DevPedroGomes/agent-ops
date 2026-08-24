@@ -17,7 +17,6 @@ def test_versao_exposta():
 def test_config_le_do_ambiente(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_REDIS_URL", "redis://exemplo:6379")
     monkeypatch.setenv("AGENT_OPS_PROJETO", "brainhub")
-    get_config.cache_clear()
 
     cfg = get_config()
 
@@ -29,6 +28,19 @@ def test_config_le_do_ambiente(monkeypatch):
 
 def test_kill_switch_desliga_por_ambiente(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
-    get_config.cache_clear()
 
     assert get_config().kill_switch is True
+
+
+def test_kill_switch_ligado_aqui_nao_pode_vazar_para_o_proximo(monkeypatch):
+    # Este teste liga o switch DE PROPOSITO e nao limpa o cache no fim. Junto
+    # com o de baixo, prende o autouse do conftest.
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
+
+    assert get_config().kill_switch is True
+
+
+def test_o_kill_switch_do_teste_anterior_nao_vazou():
+    # Sem o autouse do conftest, o lru_cache de get_config atravessaria a
+    # fronteira entre os dois testes e este leria True.
+    assert get_config().kill_switch is False

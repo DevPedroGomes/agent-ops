@@ -101,7 +101,6 @@ def test_falha_no_ttl_nao_recusa_a_chamada(monkeypatch):
     # original — cobra cota de uma chamada que nunca aconteceu.
     monkeypatch.setenv("AGENT_OPS_PROJETO", "testes")
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
-    get_config.cache_clear()
     fake = FakeRedis(falha_no_expire=True)
 
     async def _fake():
@@ -118,7 +117,6 @@ def test_falha_no_ttl_nao_recusa_a_chamada(monkeypatch):
 
 def test_redis_ilegivel_recusa(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
-    get_config.cache_clear()
 
     async def _quebrado():
         return FakeRedis(explode=True)
@@ -131,7 +129,6 @@ def test_redis_ilegivel_recusa(monkeypatch):
 
 def test_kill_switch_recusa_antes_de_tocar_no_redis(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
-    get_config.cache_clear()
 
     async def _explode():
         raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
@@ -181,7 +178,6 @@ def test_panorama_nunca_reporta_restante_negativo(redis_falso):
 
 def test_panorama_degrada_sem_derrubar_o_health_check(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
-    get_config.cache_clear()
 
     async def _quebrado():
         return FakeRedis(explode=True)
@@ -199,7 +195,6 @@ def test_redis_ilegivel_levanta_o_subtipo_de_indisponibilidade(monkeypatch):
     # chamador respondia 429 para uma queda de infra e mandava o visitante
     # tentar de novo em 30s — prazo que nao conserta uma indisponibilidade.
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
-    get_config.cache_clear()
 
     async def _quebrado():
         return FakeRedis(explode=True)
@@ -214,7 +209,6 @@ def test_teto_indisponivel_continua_sendo_pego_por_teto_atingido(monkeypatch):
     # Compatibilidade: quem ja escreve `except TetoAtingido` nao pode passar a
     # deixar a excecao subir depois desta mudanca.
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
-    get_config.cache_clear()
 
     async def _quebrado():
         return FakeRedis(explode=True)
@@ -238,7 +232,6 @@ def test_kill_switch_nao_e_indisponibilidade(monkeypatch):
     # O kill switch e uma parada DELIBERADA, nao uma falha de backend: o
     # operador desligou a demo. Continua 429, nao 503.
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "true")
-    get_config.cache_clear()
 
     async def _explode():
         raise AssertionError("nao deveria abrir conexao com o kill switch ligado")
