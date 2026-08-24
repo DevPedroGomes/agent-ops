@@ -73,6 +73,18 @@ def _hoje_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def segundos_ate_meia_noite_utc() -> int:
+    """Quanto falta para o teto resetar. Serve ao header `Retry-After`.
+
+    Piso de 1 segundo de proposito: exatamente na virada o calculo ingenuo
+    devolve 0, e `Retry-After: 0` convida o cliente a repetir imediatamente —
+    que e o laco que o teto existe para impedir.
+    """
+    agora = datetime.now(timezone.utc)
+    inicio_do_dia = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(1, int(inicio_do_dia.timestamp() + 86_400 - agora.timestamp()))
+
+
 def _chave(tipo: str, escopo: str | None = None, dia: str | None = None) -> str:
     """Monta a chave do contador. Recusa `:` dentro de `tipo`.
 

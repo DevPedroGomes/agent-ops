@@ -370,3 +370,37 @@ def test_escopo_pode_ter_dois_pontos(redis_falso):
     assert metering.cotas._chave("chat", escopo="ip:1.2.3.4", dia="2026-08-24") == (
         "ao:budget:testes:2026-08-24:chat:ip:1.2.3.4"
     )
+
+
+def test_segundos_ate_meia_noite_esta_dentro_do_dia():
+    s = metering.segundos_ate_meia_noite_utc()
+    assert 1 <= s <= 86_400
+
+
+def test_segundos_ate_meia_noite_nunca_e_zero(monkeypatch):
+    # Exatamente na virada, um calculo ingenuo devolve 0, e `Retry-After: 0`
+    # convida o cliente a repetir na mesma hora — justamente o que o teto
+    # existe para impedir. O piso de 1 segundo e o que evita esse laco.
+    from datetime import datetime, timezone
+
+    class MeiaNoiteExata(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 25, 0, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(metering.cotas, "datetime", MeiaNoiteExata)
+
+    assert metering.segundos_ate_meia_noite_utc() == 86_400
+
+
+def test_segundos_ate_meia_noite_conta_o_que_falta(monkeypatch):
+    from datetime import datetime, timezone
+
+    class VinteETres(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 24, 23, 0, 0, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(metering.cotas, "datetime", VinteETres)
+
+    assert metering.segundos_ate_meia_noite_utc() == 3_600

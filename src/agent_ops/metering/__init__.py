@@ -7,6 +7,7 @@ from agent_ops.metering.cotas import (
     consumir,
     devolver,
     panorama,
+    segundos_ate_meia_noite_utc,
 )
 
 __all__ = [
@@ -16,4 +17,5 @@ __all__ = [
     "consumir",
     "devolver",
     "panorama",
+    "segundos_ate_meia_noite_utc",
 ]
