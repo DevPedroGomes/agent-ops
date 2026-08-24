@@ -14,7 +14,7 @@ from agent_ops.config import Config, get_config
 
 
 def test_versao_exposta():
-    assert agent_ops.__version__ == "0.1.2"
+    assert agent_ops.__version__ == "0.2.0"
 
 
 def test_a_versao_tem_fonte_unica():
