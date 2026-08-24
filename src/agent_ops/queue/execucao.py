@@ -34,12 +34,19 @@ _UPSERT = text(
     INSERT INTO job_progress
         (job_id, estado, percentual, detalhe, tentativas, atualizado)
     VALUES
-        (:job_id, :estado, :percentual, :detalhe,
+        (:job_id, :estado, COALESCE(:percentual, 0), :detalhe,
          COALESCE(:tentativas, 0), CURRENT_TIMESTAMP)
     ON CONFLICT (job_id) DO UPDATE SET
         estado     = excluded.estado,
-        percentual = excluded.percentual,
-        detalhe    = excluded.detalhe,
+        -- Os tres COALESCE dizem a mesma coisa: OMITIR preserva, informar
+        -- sobrescreve. Sem eles, `descartar` (que so passa `detalhe`) zerava o
+        -- percentual e um job morto aos 80% aparecia como 0% na UI de
+        -- operacao — jogando fora o unico fato util sobre ele; e um tick de
+        -- progresso sem `detalhe` apagava a frase que a tela estava mostrando.
+        -- `percentual = 0` continua sobrescrevendo: zero e valor legitimo (um
+        -- retry recomeca a barra), so a AUSENCIA e que preserva.
+        percentual = COALESCE(:percentual, job_progress.percentual),
+        detalhe    = COALESCE(:detalhe, job_progress.detalhe),
         -- COALESCE e nao `+ 1`: `tentativas` conta RETENTATIVAS do job, e
         -- `marcar` e chamado varias vezes dentro de uma mesma tentativa para
         -- mover a barra de progresso. Incrementar aqui faria a coluna contar
@@ -63,15 +70,26 @@ def marcar(
     job_id: str,
     *,
     estado: str,
-    percentual: int = 0,
+    percentual: int | None = None,
     detalhe: str | None = None,
     tentativas: int | None = None,
 ) -> None:
     """Registra onde o job esta. Nunca derruba o job.
 
-    `tentativas` so e escrito quando informado (o worker passa `ctx["job_try"]`).
-    Omitido, o valor ja gravado e preservado — mover a barra de progresso nao
-    pode contar como uma nova tentativa.
+    `percentual`, `detalhe` e `tentativas` seguem a mesma regra: OMITIR
+    preserva o que ja estava gravado, informar sobrescreve. Antes so
+    `tentativas` fazia isso, e as consequencias eram visiveis — `descartar`,
+    que so passa `detalhe`, zerava o percentual e um job morto aos 80% aparecia
+    como 0%; e um tick de progresso sem `detalhe` apagava a frase que a UI
+    estava mostrando. `percentual=0` continua sendo gravado: zero e valor
+    legitimo (um retry recomeca a barra), so a AUSENCIA preserva.
+
+    Nao ha como limpar `detalhe` de volta para NULL, e nao precisa: a proxima
+    mensagem sobrescreve, e um job sem explicacao nenhuma na tela nao e um
+    estado que alguem queira pedir.
+
+    `tentativas` e informado pelo worker via `ctx["job_try"]`; mover a barra de
+    progresso nao pode contar como uma nova tentativa.
 
     Mesmo contrato da trilha de decisao: perder a barra de progresso e ruim,
     perder o trabalho ja feito por causa de um UPDATE e pior.
@@ -99,13 +117,18 @@ def marcar(
 
 
 def ler(engine, job_id: str) -> dict | None:
-    """Estado atual do job, ou `None` se nunca foi marcado."""
+    """Estado atual do job, ou `None` se nunca foi marcado.
+
+    `atualizado` vem junto porque sem ele "rodando" ha dez segundos e "rodando"
+    desde que o worker levou SIGKILL uma hora atras sao indistinguiveis para
+    quem le — e a segunda situacao e exatamente a que alguem precisa enxergar.
+    """
     try:
         with engine.connect() as conexao:
             linha = conexao.execute(
                 text(
-                    "SELECT job_id, estado, percentual, detalhe, tentativas "
-                    "FROM job_progress WHERE job_id = :j"
+                    "SELECT job_id, estado, percentual, detalhe, tentativas, "
+                    "atualizado FROM job_progress WHERE job_id = :j"
                 ),
                 {"j": job_id},
             ).mappings().one_or_none()
@@ -135,6 +158,11 @@ def esgotou(ctx, max_tries: int = 5) -> bool:
 
 
 def descartar(engine, job_id: str, *, motivo: str) -> None:
-    """Dead-letter: para de tentar e guarda o motivo legivel para a UI."""
+    """Dead-letter: para de tentar e guarda o motivo legivel para a UI.
+
+    Nao passa `percentual` de proposito: `marcar` preserva o que ja estava
+    gravado, entao um job morto aos 80% continua mostrando 80% — que e o dado
+    mais util que a UI de operacao tem sobre ele.
+    """
     logger.error("queue.descartado job_id=%s motivo=%s", job_id, motivo)
     marcar(engine, job_id, estado="descartado", detalhe=motivo)

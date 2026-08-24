@@ -96,3 +96,49 @@ def test_descartar_registra_o_motivo(engine):
 
     assert p["estado"] == "descartado"
     assert "5 tentativas" in p["detalhe"]
+
+
+def test_descartar_preserva_o_percentual_ja_alcancado(engine):
+    # Um job morto aos 80% mostrando 0% joga fora o unico fato util sobre ele
+    # na UI de operacao: quanto trabalho ja tinha sido feito.
+    execucao.marcar(engine, "j1", estado="rodando", percentual=80)
+    execucao.descartar(engine, "j1", motivo="provider fora do ar")
+
+    p = execucao.ler(engine, "j1")
+    assert p["estado"] == "descartado"
+    assert p["percentual"] == 80
+
+
+def test_mover_a_barra_nao_apaga_o_detalhe(engine):
+    # `detalhe` e a frase que a UI mostra. Um tick de progresso que a apaga
+    # deixa a tela sem explicacao entre uma mensagem e a proxima.
+    execucao.marcar(
+        engine, "j1", estado="rodando", percentual=10, detalhe="extraindo texto"
+    )
+    execucao.marcar(engine, "j1", estado="rodando", percentual=40)
+
+    assert execucao.ler(engine, "j1")["detalhe"] == "extraindo texto"
+
+
+def test_percentual_zero_continua_sendo_gravado(engine):
+    # So a OMISSAO preserva. Zero e um valor legitimo — um retry recomeca a
+    # barra — e precisa continuar sobrescrevendo.
+    execucao.marcar(engine, "j1", estado="rodando", percentual=90)
+    execucao.marcar(engine, "j1", estado="rodando", percentual=0)
+
+    assert execucao.ler(engine, "j1")["percentual"] == 0
+
+
+def test_primeira_marcacao_sem_percentual_grava_zero(engine):
+    execucao.marcar(engine, "j1", estado="pendente")
+
+    assert execucao.ler(engine, "j1")["percentual"] == 0
+
+
+def test_ler_devolve_quando_o_job_foi_atualizado(engine):
+    # Sem `atualizado`, "rodando" ha dez segundos e "rodando" desde que o
+    # worker levou SIGKILL uma hora atras sao indistinguiveis para quem le.
+    execucao.marcar(engine, "j1", estado="rodando", percentual=10)
+
+    p = execucao.ler(engine, "j1")
+    assert p["atualizado"] is not None
