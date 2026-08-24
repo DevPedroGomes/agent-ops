@@ -12,3 +12,39 @@ jobs:
         with: { python-version: "3.11" }
       - run: pip install -e ".[dev]"
       - run: python -m pytest tests/ -v
+
+  # `pip install -e` resolve os dois `.sql` a partir da arvore de fontes de
+  # qualquer jeito, entao o job acima NAO prova que eles viajam dentro do
+  # artefato — ele passaria verde com o `package-data` do pyproject.toml
+  # apagado, e o `pip install git+ssh://` (a unica forma de consumo deste
+  # pacote) quebraria com FileNotFoundError no boot da app. Este job constroi a
+  # wheel e a instala num venv limpo, fora da arvore de fontes, que e onde a
+  # diferenca aparece.
+  wheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install build
+      - run: python -m build --wheel --outdir dist/
+      - run: python -m venv /tmp/venv-limpo
+      - run: /tmp/venv-limpo/bin/pip install dist/*.whl
+      - name: os .sql viajaram dentro da wheel
+        # Fora da arvore de fontes de proposito: aqui `import agent_ops` so
+        # pode resolver pelo pacote instalado.
+        working-directory: /tmp
+        run: |
+          /tmp/venv-limpo/bin/python - <<'PY'
+          import agent_ops
+          from agent_ops.decisions import migracao
+          from agent_ops.queue import execucao
+          import agent_ops.metering
+
+          assert migracao.SQL_SCHEMA.strip(), "schema.sql chegou vazio na wheel"
+          assert execucao.SQL_SCHEMA.strip(), "progresso.sql chegou vazio na wheel"
+          assert "CREATE TABLE IF NOT EXISTS decisions" in migracao.SQL_SCHEMA
+          assert "CREATE TABLE IF NOT EXISTS job_progress" in execucao.SQL_SCHEMA
+          print("ok", agent_ops.__version__)
+          PY
