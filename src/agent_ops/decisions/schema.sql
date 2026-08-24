@@ -17,6 +17,12 @@
 -- Tipos propositalmente portateis (TEXT/INTEGER, sem UUID nem JSONB nativos):
 -- o mesmo DDL roda em Postgres na producao e em SQLite nos testes, sem um
 -- segundo schema para manter em sincronia.
+--
+-- NAO ESCREVA PONTO E VIRGULA nos comentarios deste arquivo, nem em prosa:
+-- `aplicar` separa os statements por esse caractere, e um deles no meio de um
+-- comentario parte o comando em dois pedacos invalidos. Nao e hipotese --
+-- alguem ja tropecou nisso editando o arquivo irmao `queue/progresso.sql`, e o
+-- erro resultante nao aponta para o comentario que o causou.
 
 CREATE TABLE IF NOT EXISTS decisions (
     id              TEXT PRIMARY KEY,
