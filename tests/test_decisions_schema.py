@@ -3,7 +3,10 @@
 O que se prende aqui:
 - o DDL e idempotente: aplicar duas vezes nao pode quebrar o boot da app;
 - a tabela guarda METADADO, nao conteudo. `input_digest` e hash, e nao existe
-  coluna para o texto da entrada — se alguem acrescentar uma, este teste cai;
+  coluna para o texto da entrada. Quem prende isso e a comparacao EXATA do
+  conjunto de colunas: qualquer coluna nova, com qualquer nome, derruba o
+  teste e passa por revisao. Uma lista de nomes proibidos nao serviria — so
+  pegaria os nomes que alguem ja imaginou, e `user_message TEXT` passaria;
 - `rule_code` existe e e obrigatorio: e ele que responde "por que decidiu
   isso?" com um codigo, nao com um paragrafo do modelo;
 - `parent_id` existe, senao nao da para ligar worker ao orquestrador.
@@ -34,7 +37,12 @@ def test_aplicar_cria_a_tabela_com_as_colunas_esperadas(tmp_path):
         "rule_code", "evidence", "outcome", "model", "tokens_in",
         "tokens_out", "cost_cents", "parent_id", "created_at",
     }
-    assert esperadas <= colunas
+    # Igualdade exata, nao subconjunto. Este assert e a unica rede de seguranca
+    # da regra mais importante da tabela: metadado, nunca conteudo. Com `<=`,
+    # acrescentar `user_message TEXT` ao schema passaria calado — o conjunto
+    # esperado continuaria contido no real. Com `==`, qualquer coluna nova
+    # derruba o teste e obriga uma decisao consciente.
+    assert esperadas == colunas
 
 
 def test_aplicar_duas_vezes_nao_quebra(tmp_path):
