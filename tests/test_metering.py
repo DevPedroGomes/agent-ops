@@ -22,10 +22,14 @@ from agent_ops.config import get_config
 class FakeRedis:
     """Dublê minimo: so o que `cotas.py` usa."""
 
-    def __init__(self, explode=False):
+    def __init__(self, explode=False, falha_no_expire=False):
         self.valores: dict[str, int] = {}
         self.expiracoes: dict[str, int] = {}
         self.explode = explode
+        # Falha SO no expire, com o incrby passando. Sem esse controle
+        # separado nao da para expressar a falha de rede entre as duas idas ao
+        # Redis — que e justamente onde a invariante quebrava.
+        self.falha_no_expire = falha_no_expire
 
     async def incrby(self, chave, quanto):
         if self.explode:
@@ -34,7 +38,7 @@ class FakeRedis:
         return self.valores[chave]
 
     async def expire(self, chave, segundos):
-        if self.explode:
+        if self.explode or self.falha_no_expire:
             raise ConnectionError("redis fora do ar")
         self.expiracoes[chave] = segundos
 
@@ -89,6 +93,27 @@ def test_estourar_o_teto_recusa_e_desfaz_o_proprio_incremento(redis_falso):
 
     # O incremento da chamada recusada foi desfeito: sobrou so o da que passou.
     assert redis_falso.valores[chave] == 1
+
+
+def test_falha_no_ttl_nao_recusa_a_chamada(monkeypatch):
+    # O TTL e faxina, nao corretude. Recusar por causa dele seria ruim; recusar
+    # SEM devolver o incremento — que era o comportamento herdado do budget.py
+    # original — cobra cota de uma chamada que nunca aconteceu.
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "testes")
+    monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
+    get_config.cache_clear()
+    fake = FakeRedis(falha_no_expire=True)
+
+    async def _fake():
+        return fake
+
+    monkeypatch.setattr(metering.cotas, "_redis", _fake)
+
+    restante = asyncio.run(metering.consumir("chat", limite=10))
+
+    assert restante == 9
+    assert fake.valores[metering.cotas._chave("chat")] == 1
+    assert fake.expiracoes == {}  # o TTL realmente nao foi aplicado
 
 
 def test_redis_ilegivel_recusa(monkeypatch):

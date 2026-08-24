@@ -81,13 +81,25 @@ async def consumir(
     try:
         r = await _redis()
         usado = await r.incrby(chave, unidades)
-        if usado == unidades:
-            await r.expire(chave, _TTL_SEGUNDOS)
-    except TetoAtingido:
-        raise
     except Exception as exc:
+        # Falhou ANTES de contar: nao ha incremento para desfazer.
         logger.error("metering.estado_ilegivel tipo=%s erro=%s", tipo, exc)
         raise TetoAtingido("This demo is temporarily unavailable.") from exc
+
+    if usado == unidades:
+        # O TTL e faxina, nao corretude: o contador ja esta certo sem ele, e a
+        # chave de amanha tem outro nome. Falhar aqui NAO pode recusar a
+        # chamada — e muito menos recusar sem devolver o incremento que acabou
+        # de acontecer. Esse era o bug herdado do `budget.py`: com o `expire`
+        # dentro do mesmo `try` do `incrby`, uma falha de rede entre as duas
+        # idas ao Redis mandava a execucao para o `except` generico, que
+        # levantava TetoAtingido sem nunca alcancar o rollback logo abaixo.
+        # Chamada recusada cobrando cota e exatamente a invariante que este
+        # modulo existe para garantir.
+        try:
+            await r.expire(chave, _TTL_SEGUNDOS)
+        except Exception:
+            logger.warning("metering.ttl_nao_aplicado chave=%s", chave, exc_info=True)
 
     if usado > limite:
         # Perdeu a corrida: devolve o proprio incremento e recusa.
