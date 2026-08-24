@@ -159,12 +159,22 @@ async def panorama(limites: dict[str, int]) -> dict:
 
     Nunca levanta. Um health check que quebra quando o Redis cai transforma
     uma degradacao parcial em pagina fora do ar.
+
+    UMA FORMA SO nos dois caminhos, sempre com `degraded`. Enquanto o caminho
+    degradado devolvia um dicionario menor, quem lia `p["remaining"][tipo]`
+    levantava KeyError exatamente quando o Redis caia — ou seja, a funcao que
+    existe para sobreviver a degradacao virava o 500 que ela deveria evitar.
+
+    Degradado, os contadores vem zerados e `degraded` avisa que eles nao valem.
+    Zero e nao `limite` porque, com o Redis ilegivel, `consumir` RECUSA: dizer
+    "restam 300" prometeria uma folga que o visitante nao tem.
     """
     dia = _hoje_utc()
     # Leitura viva, a mesma que o `consumir` usa: o health check nao pode dizer
     # "kill switch desligado" enquanto o `consumir` ja esta recusando por ele.
     ligado = kill_switch_ligado()
 
+    degradado = False
     try:
         r = await _redis()
         usados = {
@@ -172,14 +182,21 @@ async def panorama(limites: dict[str, int]) -> dict:
         }
     except Exception:
         logger.warning("metering.panorama_degradado", exc_info=True)
-        return {"date": dia, "kill_switch": ligado, "degraded": True}
+        degradado = True
+        usados = {tipo: 0 for tipo in limites}
 
     return {
         "date": dia,
         "kill_switch": ligado,
+        "degraded": degradado,
         "used": usados,
         "limits": limites,
         # `max(0, ...)`: o teto e checado depois do INCR, entao o contador pode
         # passar do limite por um instante. O selo publico nao mostra negativo.
-        "remaining": {t: max(0, limites[t] - usados[t]) for t in limites},
+        # Degradado, o restante e 0 pela mesma razao que `consumir` recusa.
+        "remaining": (
+            {t: 0 for t in limites}
+            if degradado
+            else {t: max(0, limites[t] - usados[t]) for t in limites}
+        ),
     }

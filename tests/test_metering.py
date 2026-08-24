@@ -170,7 +170,7 @@ def test_panorama_relata_uso_e_restante(redis_falso):
     assert p["limits"] == {"chat": 10, "ingest": 5}
     assert p["remaining"] == {"chat": 6, "ingest": 5}
     assert p["kill_switch"] is False
-    assert "degraded" not in p
+    assert p["degraded"] is False
 
 
 def test_panorama_nunca_reporta_restante_negativo(redis_falso):
@@ -300,3 +300,26 @@ def test_kill_switch_sem_env_cai_no_valor_da_config():
     from agent_ops.config import kill_switch_ligado
 
     assert kill_switch_ligado() is False
+
+
+def test_panorama_degradado_mantem_a_forma_do_saudavel(monkeypatch, redis_falso):
+    # Sem `used`/`limits`/`remaining` no caminho degradado, um health check que
+    # le `p["remaining"]["chat"]` levanta KeyError EXATAMENTE quando o Redis
+    # cai: a funcao que existe para sobreviver a degradacao parcial virava um
+    # 500. Uma forma so, com o `degraded` dizendo se da para confiar nos
+    # numeros, e o que torna a leitura segura nos dois casos.
+    saudavel = asyncio.run(metering.panorama({"chat": 10}))
+
+    async def _quebrado():
+        return FakeRedis(explode=True)
+
+    monkeypatch.setattr(metering.cotas, "_redis", _quebrado)
+    degradado = asyncio.run(metering.panorama({"chat": 10}))
+
+    assert degradado.keys() == saudavel.keys()
+    assert degradado["degraded"] is True
+    assert degradado["limits"] == {"chat": 10}
+    # Zero, nao `limite`: com o Redis ilegivel o `consumir` RECUSA, entao dizer
+    # "10 restantes" prometeria ao visitante uma folga que ele nao tem.
+    assert degradado["remaining"] == {"chat": 0}
+    assert degradado["used"] == {"chat": 0}
