@@ -93,7 +93,20 @@ async def consumir(
     custa cota ao proximo visitante. Quando a recusa vem de o Redis estar
     ilegivel, o tipo e `TetoIndisponivel` (subclasse), para o chamador poder
     responder 503 em vez de 429 sem inspecionar a mensagem.
+
+    `ValueError` para `unidades` nao positiva, mesma excecao a regra do
+    `marcar`: e erro de programacao e aparece no primeiro teste.
     """
+    # `unidades` e onde entra valor CALCULADO — paginas de um PDF, estimativa
+    # de tokens. Um bug de parsing ali (0 ou negativo) fazia o modulo que existe
+    # para NEGAR gasto conceder orcamento: `incrby` com valor negativo empurra o
+    # contador para baixo de zero e libera as proximas chamadas de todo mundo,
+    # sem nenhum erro. Zero e igualmente invalido: passaria pelo teto sempre sem
+    # reservar nada, quebrando a invariante de nao haver chamada paga sem cota
+    # reservada antes.
+    if unidades <= 0:
+        raise ValueError(f"unidades deve ser positiva; recebeu {unidades!r}")
+
     if kill_switch_ligado():
         logger.warning("metering.kill_switch_ativo tipo=%s", tipo)
         raise TetoAtingido("This demo is paused right now. Please try again later.")
@@ -142,8 +155,14 @@ async def devolver(tipo: str, unidades: int = 1, escopo: str | None = None) -> N
     """Devolve cota quando a chamada paga nao chegou a acontecer.
 
     Melhor esforco: uma devolucao perdida custa um pouco de folga, um gasto nao
-    registrado custa dinheiro.
+    registrado custa dinheiro. A excecao e `unidades` nao positiva, que levanta
+    `ValueError`: `devolver(-1)` e um `incrby(+1)` disfarcado, ou seja, cobrar
+    cota pela via da devolucao — o mesmo erro de sinal do `consumir`, do outro
+    lado.
     """
+    if unidades <= 0:
+        raise ValueError(f"unidades deve ser positiva; recebeu {unidades!r}")
+
     try:
         r = await _redis()
         await r.incrby(_chave(tipo, escopo), -unidades)

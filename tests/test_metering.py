@@ -323,3 +323,35 @@ def test_panorama_degradado_mantem_a_forma_do_saudavel(monkeypatch, redis_falso)
     # "10 restantes" prometeria ao visitante uma folga que ele nao tem.
     assert degradado["remaining"] == {"chat": 0}
     assert degradado["used"] == {"chat": 0}
+
+
+def test_unidades_negativa_nao_pode_dar_credito(redis_falso):
+    # `unidades` e onde entra valor CALCULADO (paginas do PDF, estimativa de
+    # tokens). Um bug de parsing ali fazia o modulo que existe para NEGAR gasto
+    # conceder orcamento: com limite=10 e unidades=-5 o retorno era 15 e o
+    # contador ia para -5, liberando as proximas chamadas de todo mundo.
+    with pytest.raises(ValueError):
+        asyncio.run(metering.consumir("chat", limite=10, unidades=-5))
+
+    assert redis_falso.valores == {}
+
+
+def test_unidades_zero_nao_reserva_nada_e_e_recusada(redis_falso):
+    # Zero passa pelo teto sempre e nao reserva nada: seria uma chamada paga
+    # sem cota reservada, que e a invariante 1 do spec.
+    with pytest.raises(ValueError):
+        asyncio.run(metering.consumir("chat", limite=10, unidades=0))
+
+    assert redis_falso.valores == {}
+
+
+def test_devolver_recusa_unidades_nao_positiva(redis_falso):
+    # `devolver(-1)` seria um `incrby(+1)` disfarçado: cobrar cota pela via de
+    # devolucao e o mesmo erro de sinal do outro lado.
+    asyncio.run(metering.consumir("chat", limite=10, unidades=2))
+
+    for invalida in (0, -1):
+        with pytest.raises(ValueError):
+            asyncio.run(metering.devolver("chat", unidades=invalida))
+
+    assert redis_falso.valores[metering.cotas._chave("chat")] == 2
