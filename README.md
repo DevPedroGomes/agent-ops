@@ -73,10 +73,12 @@ Lado que enfileira:
 from agent_ops import queue
 
 pool = await queue.criar_pool()
+digest = decisions.digerir(arquivo_bytes)
 try:
-    job_id = await queue.enfileirar(
+    await queue.enfileirar(
         pool, "processar_ingestao", doc_id,
-        digest=decisions.digerir(arquivo_bytes),
+        digest=digest,
+        tenant=user_id,          # SEMPRE, num app multi-tenant — ver abaixo
     )
 except queue.FilaCheia as e:
     return JSONResponse(
@@ -84,8 +86,21 @@ except queue.FilaCheia as e:
         status_code=429,
         headers={"Retry-After": str(e.retry_after)},
     )
-# job_id é None quando o mesmo digest já estava na fila — isso é sucesso.
+
+# `enfileirar` devolve None quando o mesmo (tenant, digest) já estava na fila —
+# isso é sucesso. Para responder ao cliente e servir o SSE, nomeie o job pelo id
+# determinístico em vez do retorno: ele existe nos dois casos.
+return {"job_id": queue.job_id_de(digest, tenant=user_id)}
 ```
+
+**Passe o `tenant`.** `digest` é hash de *conteúdo*: dois tenants subindo o mesmo
+arquivo — um formulário padrão, um relatório anual público, um modelo de CV —
+produzem o mesmo digest. Sem o tenant no id, o segundo enqueue cai na
+deduplicação do primeiro: o segundo tenant recebe "aceito" sem que job nenhum
+rode para ele e, ao consultar o progresso por esse id, lê o job do **primeiro**
+tenant. `job_progress` não tem coluna de tenant — quem separa os dois é o id.
+`tenant` é opcional só por compatibilidade; omitido, o id mantém o formato
+antigo `projeto:digest`.
 
 Lado do worker:
 
