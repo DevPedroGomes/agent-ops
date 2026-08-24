@@ -14,7 +14,21 @@ from agent_ops.config import Config, get_config
 
 
 def test_versao_exposta():
-    assert agent_ops.__version__ == "0.1.0"
+    assert agent_ops.__version__ == "0.1.2"
+
+
+def test_a_versao_tem_fonte_unica():
+    # Ate a v0.1.1 o numero estava escrito em dois lugares e eles divergiram: a
+    # tag dizia 0.1.1 e o metadado dizia 0.1.0. Este teste falha se alguem
+    # reintroduzir o literal no __init__.
+    import pathlib
+
+    fonte = (
+        pathlib.Path(agent_ops.__file__).read_text(encoding="utf-8")
+    )
+    assert '__version__ = "' not in fonte, (
+        "versao voltou a ser literal no __init__; a fonte e o pyproject"
+    )
 
 
 def test_config_le_do_ambiente(monkeypatch):

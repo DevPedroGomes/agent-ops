@@ -76,9 +76,12 @@ def _hoje_utc() -> str:
 def segundos_ate_meia_noite_utc() -> int:
     """Quanto falta para o teto resetar. Serve ao header `Retry-After`.
 
-    Piso de 1 segundo de proposito: exatamente na virada o calculo ingenuo
-    devolve 0, e `Retry-After: 0` convida o cliente a repetir imediatamente —
-    que e o laco que o teto existe para impedir.
+    Piso de 1 segundo de proposito, e o momento em que ele importa NAO e a
+    virada: na meia-noite exata o `+ 86_400` ja devolve 86400 sozinho. Quem
+    precisa do piso e o ultimo fragmento de segundo ANTES da virada — em
+    23:59:59.5 o valor real e meio segundo, o `int()` trunca para 0, e
+    `Retry-After: 0` convida o cliente a repetir imediatamente, que e o laco
+    que o teto existe para impedir.
     """
     agora = datetime.now(timezone.utc)
     inicio_do_dia = agora.replace(hour=0, minute=0, second=0, microsecond=0)

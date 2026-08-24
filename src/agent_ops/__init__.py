@@ -20,4 +20,10 @@ numa v0.1.0: o custo e um import, o risco e um caminho de resolucao de nome que
 so quebra em producao.
 """
 
-__version__ = "0.1.0"
+from importlib.metadata import version as _version
+
+# Fonte unica: o numero vive no `pyproject.toml`. Ate a v0.1.1 ele estava
+# escrito nos dois lugares, e a v0.1.1 saiu com metadado dizendo 0.1.0 —
+# exatamente a divergencia que duas fontes produzem quando alguem atualiza uma
+# so. Exige o pacote instalado, o que sempre e o caso.
+__version__ = _version("agent-ops")

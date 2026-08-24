@@ -377,10 +377,9 @@ def test_segundos_ate_meia_noite_esta_dentro_do_dia():
     assert 1 <= s <= 86_400
 
 
-def test_segundos_ate_meia_noite_nunca_e_zero(monkeypatch):
-    # Exatamente na virada, um calculo ingenuo devolve 0, e `Retry-After: 0`
-    # convida o cliente a repetir na mesma hora — justamente o que o teto
-    # existe para impedir. O piso de 1 segundo e o que evita esse laco.
+def test_segundos_ate_meia_noite_na_virada_exata(monkeypatch):
+    # Na meia-noite exata o `+ 86_400` ja corrige sozinho: este teste prende o
+    # valor, nao o piso. Quem prende o piso e o teste seguinte.
     from datetime import datetime, timezone
 
     class MeiaNoiteExata(datetime):
@@ -391,6 +390,23 @@ def test_segundos_ate_meia_noite_nunca_e_zero(monkeypatch):
     monkeypatch.setattr(metering.cotas, "datetime", MeiaNoiteExata)
 
     assert metering.segundos_ate_meia_noite_utc() == 86_400
+
+
+def test_o_piso_salva_o_ultimo_fragmento_de_segundo(monkeypatch):
+    # 23:59:59.5 -> faltam 0,5s -> `int()` trunca para 0 -> `Retry-After: 0`
+    # manda o cliente repetir na mesma hora. Sem `max(1, ...)` este teste falha
+    # com 0, e ele e o UNICO que morre se alguem apagar o piso achando que o
+    # `+ 86_400` ja cobre tudo.
+    from datetime import datetime, timezone
+
+    class QuaseVirada(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 8, 24, 23, 59, 59, 500_000, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(metering.cotas, "datetime", QuaseVirada)
+
+    assert metering.segundos_ate_meia_noite_utc() == 1
 
 
 def test_segundos_ate_meia_noite_conta_o_que_falta(monkeypatch):
