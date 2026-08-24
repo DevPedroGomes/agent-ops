@@ -7,6 +7,15 @@ entrada. O que o pacote acrescenta e o namespace do projeto, senao dois apps no
 mesmo Redis deduplicariam o trabalho um do outro, e o `tenant`, porque a chave
 de deduplicacao do spec e `(tenant, input_digest)` e nao o digest sozinho.
 
+A DEDUPLICACAO TEM PRAZO, e isso nao e ajustavel daqui: o `arq` recusa um id
+repetido enquanto existir a chave do job OU a do resultado, e `keep_result` vale
+3600s por padrao. Ou seja, a janela e de ~1h depois que o job termina. Passada
+ela, o mesmo `(tenant, digest)` entra de novo e o documento e reprocessado — e
+recobrado. Para idempotencia PERMANENTE ("este cliente ja pagou por este
+arquivo") o arq nao basta: e preciso uma linha `(tenant, digest)` no Postgres,
+consultada antes de enfileirar. Este pacote nao implementa essa linha de
+proposito — ela pertence a app que conhece a regra de cobranca.
+
 BACKPRESSURE: o `arq` guarda a fila num sorted set, entao `zcard(queue_name)` da
 a profundidade sem varrer nada. Acima do teto a API recusa com 429 e
 `Retry-After`. Uma fila que so cresce e indistinguivel de um servico fora do

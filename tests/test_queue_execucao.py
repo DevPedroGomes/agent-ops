@@ -11,6 +11,8 @@ O que se prende aqui:
 - esgotar as tentativas leva a `descartado` com motivo legivel, nao ao silencio.
 """
 
+import logging
+
 import pytest
 from arq.worker import Retry
 from sqlalchemy import create_engine
@@ -142,3 +144,53 @@ def test_ler_devolve_quando_o_job_foi_atualizado(engine):
 
     p = execucao.ler(engine, "j1")
     assert p["atualizado"] is not None
+
+
+def test_max_tentativas_e_o_default_do_esgotou():
+    # O default de `esgotou` e o `max_tries` do worker PRECISAM ser o mesmo
+    # numero. No `Worker.run_job` do arq, quando `job_try > max_tries` o job e
+    # encerrado com JobExecutionFailed SEM chamar a funcao: com
+    # `WorkerSettings.max_tries = 3` e `esgotou` valendo 5, `esgotou` nunca fica
+    # True, `descartar` nunca roda e o job sai da UI de operacao sem virar
+    # dead-letter — que e a unica razao de `descartado` existir.
+    assert execucao.esgotou({"job_try": execucao.MAX_TENTATIVAS}) is True
+    assert execucao.esgotou({"job_try": execucao.MAX_TENTATIVAS - 1}) is False
+
+
+def test_max_tentativas_e_publico_no_subpacote():
+    from agent_ops import queue
+
+    assert queue.MAX_TENTATIVAS == execucao.MAX_TENTATIVAS
+
+
+def test_falhou_registra_o_motivo_sem_perder_o_progresso(engine):
+    # `falhou` existia em ESTADOS e ninguem escrevia: toda excecao fora da
+    # prevista deixava a linha em `rodando` para sempre, indistinguivel de um
+    # job lento.
+    execucao.marcar(engine, "j1", estado="rodando", percentual=30)
+    execucao.marcar(
+        engine, "j1", estado="falhou", detalhe="ValueError: PDF corrompido"
+    )
+
+    p = execucao.ler(engine, "j1")
+    assert p["estado"] == "falhou"
+    assert p["percentual"] == 30
+    assert "PDF corrompido" in p["detalhe"]
+
+
+def test_marcar_sem_schema_deixa_o_tipo_do_erro_no_log(caplog, tmp_path):
+    # Esquecer `aplicar_schema` produz um sistema de progresso que nao reporta
+    # nada, para sempre, sem levantar erro: `marcar` engole (contrato "nunca
+    # derruba o job") e `ler` devolve None, indistinguivel de "nunca comecou".
+    # O log e a UNICA pista, e sem o tipo do erro nele "tabela nao existe"
+    # (permanente) e "conexao caiu" (transitorio) sao a mesma linha.
+    eng = create_engine(f"sqlite:///{tmp_path}/sem-schema.db")
+
+    with caplog.at_level(logging.ERROR):
+        execucao.marcar(eng, "j1", estado="rodando")
+
+    assert execucao.ler(eng, "j1") is None
+    # Na MENSAGEM, nao so no traceback: quem opera le a linha formatada, e
+    # varios formatadores de producao nao imprimem o traceback anexado.
+    mensagens = [registro.getMessage() for registro in caplog.records]
+    assert any("OperationalError" in m for m in mensagens), mensagens

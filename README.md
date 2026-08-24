@@ -108,6 +108,19 @@ decisions.registrar(
 
 ## `queue` — fila durável
 
+### Antes de tudo: aplicar o schema
+
+```python
+queue.aplicar_schema(engine)          # idempotente, roda no boot
+decisions.migracao.aplicar(engine)    # idem
+```
+
+**Não pule `queue.aplicar_schema`.** Sem a tabela `job_progress`, `marcar`
+engole o erro (contrato "nunca derruba o job") e `ler` devolve `None` — que é
+indistinguível de "esse job nunca começou". O resultado é um sistema de
+progresso que não reporta nada, para sempre, sem levantar um único erro. A
+única pista fica no log, como `queue.progresso_falhou ... erro=OperationalError`.
+
 Lado que enfileira:
 
 ```python
@@ -153,7 +166,8 @@ from agent_ops import queue
 
 async def processar_ingestao(ctx, doc_id):
     job_id = ctx["job_id"]
-    queue.marcar(engine, job_id, estado="rodando", percentual=0)
+    queue.marcar(engine, job_id, estado="rodando", percentual=0,
+                 tentativas=ctx["job_try"])
     try:
         ...
         queue.marcar(engine, job_id, estado="concluido", percentual=100)
@@ -162,15 +176,45 @@ async def processar_ingestao(ctx, doc_id):
             queue.descartar(engine, job_id, motivo=f"provider fora do ar: {e}")
             return
         queue.tentar_de_novo(ctx)      # levanta arq.Retry com backoff
+    except Exception as e:
+        # OBRIGATÓRIO. Sem este braço, qualquer exceção que você não previu
+        # falha o job no arq e deixa a linha em `rodando` **para sempre**: a UI
+        # mostra uma barra parada e ninguém consegue distinguir isso de um job
+        # lento. `raise` no fim para o arq também registrar a falha.
+        queue.marcar(engine, job_id, estado="falhou",
+                     detalhe=f"{type(e).__name__}: {e}")
+        raise
 
 class WorkerSettings:
     functions = [processar_ingestao]
     redis_settings = RedisSettings.from_dsn(os.environ["AGENT_OPS_REDIS_URL"])
     max_jobs = 4        # dimensionar para a VPS de 2 núcleos
-    max_tries = 5
+    max_tries = queue.MAX_TENTATIVAS
 ```
 
 Rodar: `arq meu_modulo.WorkerSettings`
+
+**`max_tries` tem que ser `queue.MAX_TENTATIVAS`.** No `Worker.run_job` do arq,
+quando `job_try > max_tries` o job é encerrado com `JobExecutionFailed` **sem
+chamar a função**. Com `max_tries = 3` no worker e `queue.esgotou` valendo 5, a
+tentativa que chamaria `descartar` nunca executa: nada vai para a dead-letter e
+o job some da UI de operação — que é a única razão de `descartado` existir.
+Amarrar os dois pela constante fecha isso por construção.
+
+### Limite da deduplicação: ela tem prazo
+
+O `arq` recusa um `_job_id` repetido enquanto a chave do job **ou a do
+resultado** existir. `keep_result` vale 3600s por padrão, então:
+
+> a deduplicação por `(tenant, digest)` cobre uma janela de ~1h após o término
+> do job, não para sempre.
+
+Passada a janela, o mesmo `(tenant, digest)` entra de novo e o documento é
+reprocessado — e recobrado. Para **idempotência permanente** (o caso "este
+cliente já pagou por este arquivo") não basta o arq: é preciso uma linha
+`(tenant, digest)` no Postgres, consultada antes de enfileirar. Este pacote não
+implementa essa linha; ela pertence à app que conhece a regra de cobrança.
+Ajustar `keep_result` para cima aumenta a janela, mas não a torna permanente.
 
 ## Testes
 

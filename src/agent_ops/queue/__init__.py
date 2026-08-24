@@ -3,6 +3,7 @@
 from agent_ops.queue import execucao, fila
 from agent_ops.queue.execucao import (
     ESTADOS,
+    MAX_TENTATIVAS,
     aplicar_schema,
     backoff,
     descartar,
@@ -24,6 +25,7 @@ __all__ = [
     "fila", "execucao",
     "FilaCheia", "FilaIndisponivel",
     "criar_pool", "enfileirar", "job_id_de", "profundidade",
-    "ESTADOS", "aplicar_schema", "backoff", "descartar", "esgotou",
+    "ESTADOS", "MAX_TENTATIVAS",
+    "aplicar_schema", "backoff", "descartar", "esgotou",
     "ler", "marcar", "tentar_de_novo",
 ]

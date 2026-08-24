@@ -4,6 +4,11 @@ O `arq` ja reexecuta job que levanta `Retry` e para depois de `max_tries`. O que
 ele NAO faz e contar essa historia para quem esta olhando a tela: o resultado
 expira em uma hora e um job que falhou ontem some. As funcoes daqui persistem
 o suficiente para a UI explicar o que aconteceu.
+
+CHAME `aplicar_schema` NO BOOT. Sem a tabela `job_progress`, `marcar` engole o
+erro (contrato "nunca derruba o job") e `ler` devolve `None` — o que e
+indistinguivel de "esse job nunca comecou". O sistema de progresso passa a nao
+reportar nada, para sempre, sem levantar um unico erro. A pista fica so no log.
 """
 
 from __future__ import annotations
@@ -18,6 +23,17 @@ from sqlalchemy.engine import Engine
 logger = logging.getLogger(__name__)
 
 ESTADOS = frozenset({"pendente", "rodando", "concluido", "falhou", "descartado"})
+
+# Teto de tentativas. Este numero e o MESMO que o worker precisa declarar em
+# `WorkerSettings.max_tries`, e por isso ele e exportado em vez de ficar como
+# literal: no `Worker.run_job` do arq, quando `job_try > max_tries` o job e
+# encerrado com JobExecutionFailed SEM chamar a funcao. Com `max_tries = 3` no
+# worker e `esgotou` valendo 5, a tentativa que passaria por `descartar` nunca
+# executa: `esgotou` nunca fica True, nada vai para a dead-letter, e o job
+# simplesmente some da UI de operacao — que e o unico motivo de `descartado`
+# existir. Amarrar os dois com `max_tries = queue.MAX_TENTATIVAS` fecha isso
+# por construcao, em vez de por disciplina.
+MAX_TENTATIVAS = 5
 
 # Backoff exponencial com teto. Sem crescimento, cinco tentativas contra um
 # provider fora do ar acontecem quase no mesmo segundo — sao uma chance, nao
@@ -112,8 +128,21 @@ def marcar(
                     "tentativas": tentativas,
                 },
             )
-    except Exception:
-        logger.exception("queue.progresso_falhou job_id=%s", job_id)
+    except Exception as exc:
+        # O TIPO vai na mensagem, nao so no traceback anexado. Esquecer
+        # `aplicar_schema` produz um sistema de progresso que nao reporta nada,
+        # para sempre, sem levantar erro nenhum: `marcar` engole aqui e `ler`
+        # devolve None, indistinguivel de "esse job nunca comecou". Este log e
+        # a unica pista que sobra, e sem o tipo "no such table: job_progress"
+        # (permanente, alguem esqueceu a migracao) e "connection reset"
+        # (transitorio, passa sozinho) sao a mesma linha para quem opera —
+        # varios formatadores de producao nem imprimem o traceback.
+        logger.exception(
+            "queue.progresso_falhou job_id=%s erro=%s: %s",
+            job_id,
+            type(exc).__name__,
+            exc,
+        )
 
 
 def ler(engine, job_id: str) -> dict | None:
@@ -132,8 +161,16 @@ def ler(engine, job_id: str) -> dict | None:
                 ),
                 {"j": job_id},
             ).mappings().one_or_none()
-    except Exception:
-        logger.exception("queue.leitura_progresso_falhou job_id=%s", job_id)
+    except Exception as exc:
+        # Mesma razao do `marcar`: este `None` e igual ao `None` de "job
+        # desconhecido", entao o tipo do erro no log e o que separa "falta a
+        # tabela" de "o banco piscou".
+        logger.exception(
+            "queue.leitura_progresso_falhou job_id=%s erro=%s: %s",
+            job_id,
+            type(exc).__name__,
+            exc,
+        )
         return None
 
     return dict(linha) if linha else None
@@ -152,8 +189,13 @@ def tentar_de_novo(ctx) -> None:
     raise Retry(defer=backoff(ctx["job_try"]))
 
 
-def esgotou(ctx, max_tries: int = 5) -> bool:
-    """Esta e a ultima tentativa? Se sim, o chamador deve descartar."""
+def esgotou(ctx, max_tries: int = MAX_TENTATIVAS) -> bool:
+    """Esta e a ultima tentativa? Se sim, o chamador deve descartar.
+
+    O default e `MAX_TENTATIVAS` para o worker poder declarar
+    `max_tries = queue.MAX_TENTATIVAS` e os dois numeros nunca divergirem. So
+    passe outro valor se `WorkerSettings.max_tries` tambem for esse.
+    """
     return ctx["job_try"] >= max_tries
 
 
