@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-ops"
+version = "0.1.0"
+description = "Nucleo compartilhado dos agentes do portfolio: teto de gasto, trilha de decisao e fila duravel."
+requires-python = ">=3.11"
+dependencies = [
+    "redis>=5.0",
+    "arq>=0.26",
+    "sqlalchemy>=2.0.51",
+    "pydantic-settings>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
