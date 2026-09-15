@@ -56,6 +56,12 @@ CREATE TABLE IF NOT EXISTS decisions (
     -- Trilha orquestrador -> worker. Nulo na raiz.
     parent_id       TEXT,
 
+    -- O default aqui e rede de seguranca para INSERT feito a mao. O pacote NAO
+    -- depende dele: `registrar` carimba em UTC pelo Python, porque
+    -- CURRENT_TIMESTAMP numa coluna sem fuso e resolvido pelo BANCO. O SQLite
+    -- devolve UTC, o Postgres devolve a hora da sessao. O mesmo DDL gravaria
+    -- entao coisas diferentes conforme onde roda, sem erro nenhum, e a suite
+    -- em SQLite jamais veria a diferenca. Ver `agent_ops/tempo.py`.
     created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

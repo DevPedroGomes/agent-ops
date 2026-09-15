@@ -5,3 +5,12 @@ __pycache__/
 build/
 dist/
 .DS_Store
+
+# Lock de resolucao de dependencia NAO entra aqui. Isto e biblioteca, nao
+# aplicacao: quem deploya e quem consome, e e o lock DELES que decide o que
+# roda em producao. Um lock versionado aqui faria o CI resolver sempre a mesma
+# combinacao e esconderia justamente o que ele existe para pegar, que e uma
+# versao nova de sqlalchemy, arq ou redis quebrando o pacote. Os ranges do
+# pyproject.toml sao a declaracao de compatibilidade, e resolver do zero a cada
+# run e o que os testa.
+uv.lock

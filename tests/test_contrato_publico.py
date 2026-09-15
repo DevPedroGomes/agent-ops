@@ -32,12 +32,45 @@ def test_decisions_expoe_registrar_e_digerir():
     assert hasattr(d, "digerir")
 
 
+def test_decisions_expoe_a_leitura_da_trilha():
+    import agent_ops.decisions as d
+
+    for nome in ("listar", "por_execucao", "filhos", "contagem_por_regra"):
+        assert hasattr(d, nome), f"faltou {nome} na superficie publica"
+
+
+def test_toda_consulta_de_trilha_exige_tenant_por_nome():
+    """A regra de isolamento e da assinatura, e este teste e quem a prende.
+
+    "A leitura filtra por tenant, nunca so por correlation_id" era prosa no
+    schema. Como argumento keyword-only e obrigatorio, ela vira impossivel de
+    esquecer — mas so enquanto alguem nao lhe der um default. Isto falha se
+    alguem der.
+    """
+    import inspect
+
+    from agent_ops.decisions import consultas
+
+    for funcao in (consultas.listar, consultas.por_execucao, consultas.filhos):
+        parametro = inspect.signature(funcao).parameters.get("tenant_id")
+        assert parametro is not None, f"{funcao.__name__} perdeu o tenant_id"
+        assert parametro.kind is inspect.Parameter.KEYWORD_ONLY, (
+            f"{funcao.__name__}: tenant_id tem que ser keyword-only, senao uma "
+            "troca de posicao passa o correlation_id como tenant"
+        )
+        assert parametro.default is inspect.Parameter.empty, (
+            f"{funcao.__name__}: tenant_id ganhou default, entao da para "
+            "consultar sem filtrar por tenant de novo"
+        )
+
+
 def test_queue_expoe_enfileirar_e_progresso():
     import agent_ops.queue as q
 
     for nome in (
         "enfileirar", "job_id_de", "FilaCheia", "FilaIndisponivel",
         "marcar", "ler", "descartar", "MAX_TENTATIVAS",
+        "listar_por_estado", "travados",
     ):
         assert hasattr(q, nome), f"faltou {nome} na superficie publica"
 
@@ -89,3 +122,18 @@ def test_queue_carrega_sqlalchemy_e_isso_e_esperado():
         "queue deixou de carregar SQLAlchemy; atualize o docstring de "
         "agent_ops/__init__.py, que descreve esse custo de import"
     )
+
+
+def test_as_variantes_async_estao_na_superficie():
+    """Quem chama de dentro de `async def` precisa achar a versao que nao trava.
+
+    Sem estar no `__init__`, `aio` so aparece para quem ja sabe que existe, e
+    quem nao sabe e exatamente quem vai bloquear o event loop.
+    """
+    import agent_ops.decisions as d
+    import agent_ops.queue as q
+
+    assert hasattr(d, "aio")
+    assert hasattr(d.aio, "registrar")
+    assert hasattr(q, "aio")
+    assert hasattr(q.aio, "marcar")

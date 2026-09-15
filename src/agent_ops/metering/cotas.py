@@ -12,7 +12,10 @@ Decisoes, todas herdadas do `budget.py` do BrainHub:
 - O dia vira em UTC, para o reset nao andar com o fuso do servidor.
 - INCR primeiro e checa depois: duas requisicoes concorrentes enxergam cada uma
   o proprio total pos-incremento, entao nenhuma escapa do teto. Quem perde
-  desfaz o proprio incremento.
+  desfaz o proprio incremento. As tres coisas (reservar, checar, desfazer)
+  acontecem num script Lua, num passo indivisivel: enquanto a compensacao era
+  uma segunda ida ao Redis, uma falha nela deixava a chamada RECUSADA cobrando
+  cota, que e a unica coisa que este modulo existe para impedir.
 - Se o Redis nao responde, RECUSA. Um teto ilegivel nao e um teto ausente —
   mas o tipo levantado e `TetoIndisponivel`, para o chamador separar 503 de 429.
 - O kill switch e configuracao de ambiente, para estancar sem redeploy. Ele e
@@ -29,7 +32,9 @@ o teto global sem que um consuma o do outro).
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from collections.abc import Awaitable
+from datetime import UTC, datetime
+from typing import Any, cast
 
 import redis.asyncio as aioredis
 
@@ -70,7 +75,7 @@ class TetoIndisponivel(TetoAtingido):
 
 
 def _hoje_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return datetime.now(UTC).strftime("%Y-%m-%d")
 
 
 def segundos_ate_meia_noite_utc() -> int:
@@ -83,7 +88,7 @@ def segundos_ate_meia_noite_utc() -> int:
     `Retry-After: 0` convida o cliente a repetir imediatamente, que e o laco
     que o teto existe para impedir.
     """
-    agora = datetime.now(timezone.utc)
+    agora = datetime.now(UTC)
     inicio_do_dia = agora.replace(hour=0, minute=0, second=0, microsecond=0)
     return max(1, int(inicio_do_dia.timestamp() + 86_400 - agora.timestamp()))
 
@@ -108,8 +113,128 @@ def _chave(tipo: str, escopo: str | None = None, dia: str | None = None) -> str:
 async def _redis() -> aioredis.Redis:
     global _cliente
     if _cliente is None:
-        _cliente = aioredis.from_url(get_config().redis_url, decode_responses=True)
+        # `from_url` do redis-py nao e anotada, entao o mypy em strict recusa
+        # a chamada. O tipo do retorno esta certo e e o que importa aqui.
+        _cliente = aioredis.from_url(  # type: ignore[no-untyped-call]
+            get_config().redis_url, decode_responses=True
+        )
     return _cliente
+
+
+async def fechar() -> None:
+    """Fecha o cliente do Redis e solta o singleton. Chame no shutdown da app.
+
+    O cliente e criado na primeira chamada e vivia ate o processo morrer. Isso
+    e barato num servico em pe, e atrapalha em dois lugares concretos:
+
+    - desligamento. O pool fica aberto, e um interpretador saindo sob carga
+      reclama de conexao nao fechada no meio do log de shutdown;
+    - mais de um event loop no mesmo processo. O cliente amarra no loop que o
+      tocou primeiro, entao um script que chama `asyncio.run` duas vezes
+      encontra na segunda um cliente preso a um loop ja fechado. Sem uma forma
+      de soltar o singleton, nao havia saida a nao ser reiniciar o processo.
+
+    NAO LEVANTA, e o singleton sai mesmo quando o `aclose` falha: o backend ja
+    estar fora do ar e justamente uma das razoes de estar desligando, e um
+    cliente que ninguem consegue fechar nem substituir e pior que um socket
+    vazado. Mesmo contrato do `devolver`.
+
+    Depois desta chamada, a proxima operacao abre um cliente novo.
+    """
+    global _cliente
+    if _cliente is None:
+        return
+
+    cliente, _cliente = _cliente, None
+    try:
+        await cliente.aclose()
+    except Exception:
+        logger.warning("metering.fechamento_falhou", exc_info=True)
+
+
+# Reserva e checagem de teto num passo indivisivel, no servidor.
+#
+# POR QUE NAO DA PARA FAZER ISSO EM DUAS IDAS AO REDIS: a invariante central do
+# modulo e "uma chamada recusada nao custa cota ao proximo visitante". Contando
+# primeiro e compensando depois, essa promessa fica dependendo de uma SEGUNDA
+# chamada dar certo. Quando ela nao da (rede piscou, processo morreu no meio),
+# o contador fica inflado ate a virada do dia e visitantes seguintes sao
+# recusados por cota que ninguem gastou. Nao havia como consertar isso do lado
+# do cliente: qualquer compensacao e uma nova viagem que pode falhar.
+#
+# `redis.call` no INCRBY e `redis.pcall` no EXPIRE, e a diferenca e deliberada.
+# Script de Redis NAO desfaz o que ja escreveu quando aborta, igual a MULTI/
+# EXEC: um erro no EXPIRE com `call` derrubaria o script DEPOIS de o INCRBY ter
+# valido, e seria o bug herdado do `budget.py` de volta, agora escondido dentro
+# do Lua. Com `pcall` o EXPIRE erra sem abortar nada, que e o tratamento certo
+# para uma faxina. Um erro no INCRBY, esse sim, aborta antes de qualquer
+# escrita: nao ha o que desfazer e o chamador recusa.
+#
+# Devolve {recusado, usado, ttl_aplicado}.
+_LUA_CONSUMIR = """
+local usado = redis.call('INCRBY', KEYS[1], ARGV[1])
+local ttl_ok = 1
+local ttl = redis.pcall('EXPIRE', KEYS[1], ARGV[3])
+if type(ttl) == 'table' and ttl.err then ttl_ok = 0 end
+if usado > tonumber(ARGV[2]) then
+  redis.call('INCRBY', KEYS[1], -tonumber(ARGV[1]))
+  return {1, usado, ttl_ok}
+end
+return {0, usado, ttl_ok}
+"""
+
+
+async def _incrementar_com_ttl(
+    r: aioredis.Redis, chave: str, quanto: int
+) -> tuple[Any, Any]:
+    """`INCRBY` e `EXPIRE` numa transacao so. Devolve os dois resultados.
+
+    Uma ida ao Redis em vez de duas, e o TTL deixa de depender de adivinhar
+    qual chamada e a primeira. O gatilho anterior era `usado == unidades`, que
+    so acerta quando o contador comeca em zero: bastava uma devolucao orfa
+    deixar a chave negativa para o passo pular o valor reservado (-1, 1, 3, 5
+    com `unidades=2`) e o `EXPIRE` nunca acontecer. A chave entao sobrevivia a
+    todas as viradas de dia, uma por (projeto, dia, tipo, escopo), para sempre.
+
+    Renovar o TTL a cada chamada e de proposito e nao atrapalha: o nome da
+    chave ja carrega o dia, entao renovar so faz a chave viver 48h depois do
+    ultimo uso, que e exatamente a faxina desejada.
+
+    `raise_on_error=False` porque o Redis NAO desfaz uma transacao quando um
+    comando falha: os outros rodam, e o erro volta na posicao do que falhou.
+    Levantar tudo junto colocaria o `EXPIRE` de volta no mesmo escopo de erro
+    do `INCRBY`, que e a forma exata do bug herdado do `budget.py`. Quem chama
+    inspeciona cada slot.
+    """
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.incrby(chave, quanto)
+        pipe.expire(chave, _TTL_SEGUNDOS)
+        usado, ttl = await pipe.execute(raise_on_error=False)
+    return usado, ttl
+
+
+async def _pisar_em_zero(
+    r: aioredis.Redis, chave: str, observado: int
+) -> None:
+    """Desfaz exatamente o excesso abaixo de zero. Nao zera a chave.
+
+    Some o proprio excesso (`-observado`) em vez de `SET chave 0` porque um
+    consumo concorrente pode ter entrado no meio: o `SET` apagaria esse consumo
+    e daria a chamada dele de graca. Somar de volta so o que se observou abaixo
+    de zero e comutativo com qualquer `incrby` paralelo.
+
+    A correcao nao e atomica com a leitura, e sob concorrencia ela pode sobrar:
+    duas devolucoes orfas simultaneas veem -1 e -2, somam +1 e +2, e o contador
+    para em +1 em vez de 0. Isso e um erro para CIMA, ou seja, uma unidade de
+    cota a menos para os visitantes. A direcao importa: o modulo inteiro existe
+    para nunca errar para baixo, que e o lado que gasta dinheiro. Tornar isso
+    exato exigiria script Lua no servidor, e o preco nao se paga para consertar
+    um caso que ja e patologico.
+    """
+    try:
+        await r.incrby(chave, -observado)
+    except Exception:
+        logger.warning("metering.piso_nao_aplicado chave=%s", chave, exc_info=True)
 
 
 async def consumir(
@@ -120,10 +245,12 @@ async def consumir(
 ) -> int:
     """Gasta `unidades` da cota de hoje. Devolve o quanto sobrou.
 
-    Levanta `TetoAtingido` sem ter consumido nada — uma chamada recusada nao
-    custa cota ao proximo visitante. Quando a recusa vem de o Redis estar
-    ilegivel, o tipo e `TetoIndisponivel` (subclasse), para o chamador poder
-    responder 503 em vez de 429 sem inspecionar a mensagem.
+    Levanta `TetoAtingido` sem ter consumido nada, e isso e garantido pelo
+    servidor e nao pela sorte: reservar, checar e desfazer sao um script so.
+    Uma chamada recusada nao custa cota ao proximo visitante. Quando a recusa
+    vem de o Redis estar ilegivel, o tipo e `TetoIndisponivel` (subclasse),
+    para o chamador poder responder 503 em vez de 429 sem inspecionar a
+    mensagem.
 
     `ValueError` para `unidades` nao positiva, mesma excecao a regra do
     `marcar`: e erro de programacao e aparece no primeiro teste.
@@ -145,33 +272,38 @@ async def consumir(
     chave = _chave(tipo, escopo)
     try:
         r = await _redis()
-        usado = await r.incrby(chave, unidades)
+        # Argumentos como texto porque e assim que eles viajam no protocolo:
+        # todo ARGV chega no Lua como string de qualquer jeito, e o script ja
+        # faz `tonumber` onde precisa de numero.
+        # O `cast` existe porque os stubs do redis-py descrevem `eval` com o
+        # retorno de sincrono e assincrono unidos (`Awaitable[str] | str`), e
+        # nao da para dar `await` nisso. O tipo de verdade e o do script: os
+        # tres inteiros que ele devolve.
+        recusado, usado, ttl_ok = await cast(
+            "Awaitable[list[int]]",
+            r.eval(
+                _LUA_CONSUMIR,
+                1,
+                chave,
+                str(unidades),
+                str(limite),
+                str(_TTL_SEGUNDOS),
+            ),
+        )
     except Exception as exc:
-        # Falhou ANTES de contar: nao ha incremento para desfazer.
+        # O script e indivisivel: ou ele reservou, ou nao escreveu nada. Nao ha
+        # incremento pendente para desfazer neste caminho.
         logger.error("metering.estado_ilegivel tipo=%s erro=%s", tipo, exc)
         raise TetoIndisponivel("This demo is temporarily unavailable.") from exc
 
-    if usado == unidades:
-        # O TTL e faxina, nao corretude: o contador ja esta certo sem ele, e a
-        # chave de amanha tem outro nome. Falhar aqui NAO pode recusar a
-        # chamada — e muito menos recusar sem devolver o incremento que acabou
-        # de acontecer. Esse era o bug herdado do `budget.py`: com o `expire`
-        # dentro do mesmo `try` do `incrby`, uma falha de rede entre as duas
-        # idas ao Redis mandava a execucao para o `except` generico, que
-        # levantava TetoAtingido sem nunca alcancar o rollback logo abaixo.
-        # Chamada recusada cobrando cota e exatamente a invariante que este
-        # modulo existe para garantir.
-        try:
-            await r.expire(chave, _TTL_SEGUNDOS)
-        except Exception:
-            logger.warning("metering.ttl_nao_aplicado chave=%s", chave, exc_info=True)
+    if not ttl_ok:
+        # Faxina, nao corretude: o contador ja esta certo sem TTL e a chave de
+        # amanha tem outro nome. O `pcall` la dentro garantiu que isto nao
+        # recusou nada.
+        logger.warning("metering.ttl_nao_aplicado chave=%s", chave)
 
-    if usado > limite:
-        # Perdeu a corrida: devolve o proprio incremento e recusa.
-        try:
-            await r.incrby(chave, -unidades)
-        except Exception:
-            logger.exception("metering.rollback_falhou tipo=%s", tipo)
+    if recusado:
+        # A devolucao ja aconteceu dentro do script, junto com o incremento.
         logger.warning(
             "metering.esgotado tipo=%s usado=%d limite=%d", tipo, usado, limite
         )
@@ -179,7 +311,7 @@ async def consumir(
             "This demo reached today's usage cap. It resets at midnight UTC."
         )
 
-    return limite - usado
+    return limite - int(usado)
 
 
 async def devolver(tipo: str, unidades: int = 1, escopo: str | None = None) -> None:
@@ -190,18 +322,33 @@ async def devolver(tipo: str, unidades: int = 1, escopo: str | None = None) -> N
     `ValueError`: `devolver(-1)` e um `incrby(+1)` disfarcado, ou seja, cobrar
     cota pela via da devolucao — o mesmo erro de sinal do `consumir`, do outro
     lado.
+
+    NAO DEIXA O CONTADOR NEGATIVO. A chave e calculada com o dia de HOJE, entao
+    uma chamada reservada as 23:59:59 cuja devolucao acontece as 00:00:01 cai
+    na chave de AMANHA, que ainda nao existe — e um `incrby` negativo CRIA a
+    chave em -N. O teto do dia seguinte entao sobe por esse valor, para todo
+    mundo, e nao se corrige sozinho ate a virada seguinte. Devolver o que nunca
+    foi consumido tem que ser inofensivo, nao virar credito.
     """
     if unidades <= 0:
         raise ValueError(f"unidades deve ser positiva; recebeu {unidades!r}")
 
+    chave = _chave(tipo, escopo)
     try:
         r = await _redis()
-        await r.incrby(_chave(tipo, escopo), -unidades)
+        # Com TTL tambem aqui: uma devolucao pode CRIAR a chave (a que
+        # atravessa a virada do dia UTC cai na chave de amanha, que ainda nao
+        # existe), e uma chave criada sem TTL fica no Redis para sempre.
+        novo, _ = await _incrementar_com_ttl(r, chave, -unidades)
+        if isinstance(novo, int) and novo < 0:
+            await _pisar_em_zero(r, chave, novo)
     except Exception as exc:
         logger.error("metering.devolucao_falhou tipo=%s erro=%s", tipo, exc)
 
 
-async def panorama(limites: dict[str, int]) -> dict:
+async def panorama(
+    limites: dict[str, int], escopo: str | None = None
+) -> dict[str, Any]:
     """Uso de hoje. Serve ao health check e a um selo na UI.
 
     Recebe os limites em vez de le-los da configuracao: cada projeto tem os
@@ -218,6 +365,16 @@ async def panorama(limites: dict[str, int]) -> dict:
     Degradado, os contadores vem zerados e `degraded` avisa que eles nao valem.
     Zero e nao `limite` porque, com o Redis ilegivel, `consumir` RECUSA: dizer
     "restam 300" prometeria uma folga que o visitante nao tem.
+
+    `escopo` le a MESMA conta que `consumir(escopo=...)` move. Sem ele, um teto
+    por IP existia, recusava chamadas e nao aparecia em lugar nenhum: nem no
+    health check nem num selo dizendo ao visitante quanto lhe resta. O escopo
+    volta no resultado para o chamador nao confundir o relato global com o de
+    alguem, ja que as duas contas sao separadas de proposito.
+
+    Nao existe "panorama de todos os escopos": a chave de escopo e por IP, e
+    varrer o Redis para enumera-los seria um SCAN de tamanho imprevisivel no
+    caminho do health check. Pergunte pelo escopo que interessa.
     """
     dia = _hoje_utc()
     # Leitura viva, a mesma que o `consumir` usa: o health check nao pode dizer
@@ -228,15 +385,17 @@ async def panorama(limites: dict[str, int]) -> dict:
     try:
         r = await _redis()
         usados = {
-            tipo: int(await r.get(_chave(tipo, dia=dia)) or 0) for tipo in limites
+            tipo: int(await r.get(_chave(tipo, escopo, dia)) or 0)
+            for tipo in limites
         }
     except Exception:
         logger.warning("metering.panorama_degradado", exc_info=True)
         degradado = True
-        usados = {tipo: 0 for tipo in limites}
+        usados = dict.fromkeys(limites, 0)
 
     return {
         "date": dia,
+        "escopo": escopo,
         "kill_switch": ligado,
         "degraded": degradado,
         "used": usados,
@@ -245,7 +404,7 @@ async def panorama(limites: dict[str, int]) -> dict:
         # passar do limite por um instante. O selo publico nao mostra negativo.
         # Degradado, o restante e 0 pela mesma razao que `consumir` recusa.
         "remaining": (
-            {t: 0 for t in limites}
+            dict.fromkeys(limites, 0)
             if degradado
             else {t: max(0, limites[t] - usados[t]) for t in limites}
         ),

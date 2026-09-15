@@ -17,6 +17,10 @@ CREATE TABLE IF NOT EXISTS job_progress (
     percentual  INTEGER NOT NULL DEFAULT 0,
     detalhe     TEXT,
     tentativas  INTEGER NOT NULL DEFAULT 0,
+    -- Default como rede de seguranca para INSERT a mao. `marcar` carimba em
+    -- UTC pelo Python: achar job travado compara este valor com o UTC de
+    -- agora, e CURRENT_TIMESTAMP segue o fuso da sessao no Postgres. Ver
+    -- `agent_ops/tempo.py`.
     atualizado  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

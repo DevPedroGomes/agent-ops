@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-ops"
-version = "0.2.0"
+version = "0.3.0"
 description = "Nucleo compartilhado dos agentes do portfolio: teto de gasto, trilha de decisao e fila duravel."
 requires-python = ">=3.12"
 dependencies = [
@@ -15,11 +15,69 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# `psycopg` so para os testes de portabilidade: o pacote nao escolhe driver
+# para quem o consome, ele recebe uma Engine pronta.
+dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "ruff>=0.6", "mypy>=1.11"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
+# `py.typed` e o que faz as anotacoes atravessarem para quem consome (PEP 561).
+# Sem ele o pacote instalado e opaco: o mypy do consumidor trata tudo como Any
+# e as assinaturas daqui nao valem nada do outro lado.
+"agent_ops" = ["py.typed"]
 "agent_ops.decisions" = ["*.sql"]
 "agent_ops.queue" = ["*.sql"]
+
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF", "TRY", "BLE", "DTZ", "PT"]
+ignore = [
+    # `__all__` agrupado por modulo e por assunto em vez de alfabetico. A ordem
+    # conta o que o subpacote oferece, e ordenar apaga essa informacao.
+    "RUF022",
+    # `except Exception` e o contrato, nao um descuido. `registrar`, `marcar`,
+    # `ler`, `devolver`, `panorama` e `fechar` prometem nunca levantar, e cada
+    # um desses blocos tem comentario dizendo por que. Estreitar os tipos
+    # deixaria o contrato valer so para os erros que alguem ja imaginou.
+    "BLE001",
+    # O TIPO da excecao vai na mensagem de proposito, nao so no traceback
+    # anexado: varios formatadores de producao nao imprimem traceback, e ai
+    # "no such table" (permanente) e "connection reset" (passageiro) viram a
+    # mesma linha para quem opera. Ver o comentario no `marcar`.
+    "TRY400", "TRY401",
+    # Mensagem de excecao escrita na hora, com o valor recebido dentro. Extrair
+    # para constante afastaria a explicacao do lugar onde ela importa.
+    "TRY003",
+    # `raise ... from exc` ja e usado onde a origem importa. Nos pontos onde
+    # nao esta, a excecao original nao acrescenta nada ao chamador.
+    "TRY300",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+    # Um `datetime` ingenuo e o INSUMO do teste: ele existe para fazer o
+    # `json.dumps` levantar e provar que `registrar` nao derruba o chamador.
+    "DTZ001",
+    # `ValueError` e uma classe deliberada aqui: e o sinal de erro de
+    # PROGRAMACAO, separado das excecoes de dominio (`TetoAtingido`,
+    # `FilaCheia`) justamente para nao se confundir com elas. O tipo e o
+    # contrato. Onde a mesma funcao valida mais de uma coisa, os testes usam
+    # `match=` mesmo assim; exigir `match` em todos acoplaria a suite a
+    # redacoes que os docstrings mantem longas de proposito.
+    "PT011",
+]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/agent_ops"]
+strict = true
+# O `arq` nao publica `py.typed`, entao os simbolos dele chegam como Any.
+[[tool.mypy.overrides]]
+module = ["arq.*"]
+ignore_missing_imports = true

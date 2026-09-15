@@ -1,16 +1,20 @@
 """Fila duravel sobre arq."""
 
-from agent_ops.queue import execucao, fila
+from agent_ops.queue import aio, execucao, fila
 from agent_ops.queue.execucao import (
     ESTADOS,
+    ESTADOS_TERMINAIS,
     MAX_TENTATIVAS,
     aplicar_schema,
     backoff,
     descartar,
     esgotou,
     ler,
+    listar_por_estado,
     marcar,
+    purgar,
     tentar_de_novo,
+    travados,
 )
 from agent_ops.queue.fila import (
     FilaCheia,
@@ -22,10 +26,11 @@ from agent_ops.queue.fila import (
 )
 
 __all__ = [
-    "fila", "execucao",
+    "aio", "fila", "execucao",
     "FilaCheia", "FilaIndisponivel",
     "criar_pool", "enfileirar", "job_id_de", "profundidade",
-    "ESTADOS", "MAX_TENTATIVAS",
+    "ESTADOS", "ESTADOS_TERMINAIS", "MAX_TENTATIVAS",
     "aplicar_schema", "backoff", "descartar", "esgotou",
-    "ler", "marcar", "tentar_de_novo",
+    "ler", "listar_por_estado", "marcar", "purgar", "tentar_de_novo",
+    "travados",
 ]

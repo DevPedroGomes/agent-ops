@@ -11,6 +11,7 @@ O que se prende aqui:
 - esgotar as tentativas leva a `descartado` com motivo legivel, nao ao silencio.
 """
 
+import datetime
 import logging
 
 import pytest
@@ -144,6 +145,34 @@ def test_ler_devolve_quando_o_job_foi_atualizado(engine):
 
     p = execucao.ler(engine, "j1")
     assert p["atualizado"] is not None
+
+
+def test_atualizado_volta_como_datetime_e_nao_como_texto(engine):
+    """O unico uso de `atualizado` e aritmetica, entao ele tem que vir pronto.
+
+    O driver do Postgres devolve `datetime`, o do SQLite devolvia a string
+    crua. Quem escrevesse a deteccao de job travado (`agora - atualizado >
+    limite`) contra a suite em SQLite levava TypeError, e contra o Postgres
+    funcionava. O tipo devolvido nao pode depender do banco.
+    """
+    execucao.marcar(engine, "j1", estado="rodando")
+
+    atualizado = execucao.ler(engine, "j1")["atualizado"]
+
+    assert isinstance(atualizado, datetime.datetime), (
+        f"veio {type(atualizado).__name__}; nao da para subtrair de um datetime"
+    )
+    assert atualizado.tzinfo is None, "ingenuo em UTC, igual ao que foi gravado"
+
+
+def test_atualizado_esta_em_utc(engine):
+    """Carimbado pelo pacote, nao pelo default do banco."""
+    antes = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    execucao.marcar(engine, "j1", estado="rodando")
+
+    atualizado = execucao.ler(engine, "j1")["atualizado"]
+
+    assert abs((atualizado - antes).total_seconds()) < 60
 
 
 def test_max_tentativas_e_o_default_do_esgotou():

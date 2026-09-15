@@ -6,6 +6,7 @@ from agent_ops.metering.cotas import (
     TetoIndisponivel,
     consumir,
     devolver,
+    fechar,
     panorama,
     segundos_ate_meia_noite_utc,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "TetoIndisponivel",
     "consumir",
     "devolver",
+    "fechar",
     "panorama",
     "segundos_ate_meia_noite_utc",
 ]

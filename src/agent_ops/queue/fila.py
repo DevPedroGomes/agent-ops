@@ -30,6 +30,7 @@ sem comparar mensagem.
 from __future__ import annotations
 
 import logging
+from typing import Any, Protocol
 
 from arq import create_pool
 from arq.connections import ArqRedis, RedisSettings
@@ -38,6 +39,21 @@ from arq.constants import default_queue_name
 from agent_ops.config import exigir_sem_dois_pontos, get_config
 
 logger = logging.getLogger(__name__)
+
+
+class Pool(Protocol):
+    """O minimo que `enfileirar` e `profundidade` usam de um pool do arq.
+
+    Protocol e nao `ArqRedis` porque as duas funcoes so tocam dois metodos, e
+    anotar a classe concreta transformaria os dublês dos testes em erro de tipo
+    sem que nada no runtime mudasse. O contrato real e este, e ele ja estava
+    descrito em prosa no docstring do `profundidade`.
+    """
+
+    async def zcard(self, nome: str) -> int: ...
+
+    async def enqueue_job(self, funcao: str, *args: Any, **kwargs: Any) -> Any: ...
+
 
 # Quanto pedir ao cliente para esperar quando a fila esta cheia.
 _RETRY_AFTER_SEGUNDOS = 30
@@ -107,7 +123,7 @@ async def criar_pool() -> ArqRedis:
     return await create_pool(RedisSettings.from_dsn(get_config().redis_url))
 
 
-async def profundidade(pool) -> int:
+async def profundidade(pool: Pool) -> int:
     """Quantos jobs estao esperando. Levanta se o Redis nao responde.
 
     Le a fila DO POOL, nao a padrao: `create_pool(default_queue_name=...)` deixa
@@ -123,12 +139,12 @@ async def profundidade(pool) -> int:
 
 
 async def enfileirar(
-    pool,
+    pool: Pool,
     funcao: str,
-    *args,
+    *args: Any,
     digest: str,
     tenant: str | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> str | None:
     """Enfileira `funcao` se ainda nao houver job com o mesmo `(tenant, digest)`.
 
@@ -150,8 +166,18 @@ async def enfileirar(
     ele; omitido, o id mantem o formato antigo `projeto:digest`.
 
     Levanta `FilaCheia` quando a fila passou do teto e `FilaIndisponivel`
-    (subclasse) quando a fila nao pode ser lida — 429 e 503, respectivamente.
+    (subclasse) quando a fila nao pode ser lida NEM gravada — 429 e 503,
+    respectivamente. As duas idas ao Redis (ler a profundidade, gravar o job)
+    estao cobertas: uma queda em qualquer uma delas vira `FilaIndisponivel`,
+    nunca a excecao crua do driver.
     """
+    # ANTES de qualquer ida ao Redis, e fora do `try` que traduz falha de
+    # backend: um `:` no tenant ou no digest e erro de programacao e tem que
+    # continuar saindo como `ValueError`. Traduzido para `FilaIndisponivel`,
+    # ele viraria um 503 intermitente e ninguem procuraria o bug no proprio
+    # chamador. Validar aqui tambem evita gastar um round trip para recusar.
+    job_id = _job_id(digest, tenant)
+
     teto = get_config().profundidade_maxima
     try:
         atual = await profundidade(pool)
@@ -163,11 +189,19 @@ async def enfileirar(
         logger.warning("queue.cheia atual=%d teto=%d", atual, teto)
         raise FilaCheia("The queue is full right now. Please retry shortly.")
 
-    job = await pool.enqueue_job(
-        funcao, *args, _job_id=_job_id(digest, tenant), **kwargs
-    )
+    try:
+        job = await pool.enqueue_job(funcao, *args, _job_id=job_id, **kwargs)
+    except Exception as exc:
+        # A gravacao do job e uma SEGUNDA ida ao Redis, e o `try` acima so
+        # cobria a leitura da profundidade. Uma queda nesta janela deixava a
+        # excecao crua do driver subir: quem seguiu o README e escreveu
+        # `except FilaIndisponivel` / `except FilaCheia` respondia 500, nao o
+        # 503 que o contrato promete. O subtipo existe para distinguir
+        # indisponibilidade de saturacao, e so vale se cobrir todo o caminho.
+        logger.error("queue.enqueue_falhou tenant=%s erro=%s", tenant, exc)
+        raise FilaIndisponivel("The queue is temporarily unavailable.") from exc
     if job is None:
         logger.info("queue.duplicado tenant=%s digest=%s", tenant, digest)
         return None
 
-    return job.job_id
+    return str(job.job_id)

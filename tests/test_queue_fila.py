@@ -23,11 +23,15 @@ from agent_ops.config import get_config
 
 
 class FakePool:
-    def __init__(self, profundidade=0, explode=False):
+    def __init__(self, profundidade=0, explode=False, explode_no_enqueue=False):
         self.enfileirados: list[tuple] = []
         self.ids_existentes: set[str] = set()
         self._profundidade = profundidade
         self.explode = explode
+        # Falha SO no enqueue, com o zcard passando: a janela entre as duas
+        # idas ao Redis. Sem esse controle separado nao da para expressar a
+        # queda que acontece DEPOIS de a profundidade ter sido lida.
+        self.explode_no_enqueue = explode_no_enqueue
 
     async def zcard(self, _nome):
         if self.explode:
@@ -35,6 +39,8 @@ class FakePool:
         return self._profundidade
 
     async def enqueue_job(self, funcao, *args, _job_id=None, **kwargs):
+        if self.explode or self.explode_no_enqueue:
+            raise ConnectionError("redis fora do ar")
         if _job_id in self.ids_existentes:
             return None  # arq devolve None quando o id ja existe
         self.ids_existentes.add(_job_id)
@@ -270,3 +276,26 @@ def test_enfileirar_recusa_tenant_ambiguo():
         )
 
     assert pool.enfileirados == []
+
+
+def test_queda_entre_a_leitura_da_profundidade_e_o_enqueue_vira_indisponivel():
+    """A traducao de erro tem que cobrir as DUAS idas ao Redis, nao so a primeira.
+
+    O `try` cobria apenas `profundidade`. Uma queda na janela entre ler a fila
+    e gravar o job deixava a excecao crua do driver subir, e quem seguiu o
+    README (`except FilaIndisponivel` / `except FilaCheia`) devolvia 500 em vez
+    do 503 que o contrato do pacote promete. O ponto do subtipo e justamente
+    poder distinguir indisponibilidade sem inspecionar mensagem.
+    """
+    pool = FakePool(explode_no_enqueue=True)
+
+    with pytest.raises(queue.FilaIndisponivel):
+        asyncio.run(queue.enfileirar(pool, "ingest", digest="abc", tenant="t1"))
+
+
+def test_a_queda_no_enqueue_continua_sendo_pega_por_fila_cheia():
+    """Subclasse, entao quem so escreveu `except FilaCheia` segue funcionando."""
+    pool = FakePool(explode_no_enqueue=True)
+
+    with pytest.raises(queue.FilaCheia):
+        asyncio.run(queue.enfileirar(pool, "ingest", digest="abc", tenant="t1"))

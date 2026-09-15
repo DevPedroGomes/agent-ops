@@ -12,10 +12,13 @@ import hashlib
 import json
 import logging
 import uuid
+from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import DateTime, bindparam, text
+from sqlalchemy.engine import Engine
 
 from agent_ops.config import get_config
+from agent_ops.tempo import agora_utc
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +26,15 @@ _INSERT = text(
     """
     INSERT INTO decisions (
         id, project, tenant_id, correlation_id, input_digest, rule_code,
-        evidence, outcome, model, tokens_in, tokens_out, cost_cents, parent_id
+        evidence, outcome, model, tokens_in, tokens_out, cost_cents, parent_id,
+        created_at
     ) VALUES (
         :id, :project, :tenant_id, :correlation_id, :input_digest, :rule_code,
         :evidence, :outcome, :model, :tokens_in, :tokens_out, :cost_cents,
-        :parent_id
+        :parent_id, :created_at
     )
     """
-)
+).bindparams(bindparam("created_at", type_=DateTime))
 
 
 def digerir(payload: str | bytes) -> str:
@@ -46,14 +50,14 @@ def digerir(payload: str | bytes) -> str:
 
 
 def registrar(
-    engine,
+    engine: Engine,
     *,
     tenant_id: str,
     correlation_id: str,
     input_digest: str,
     rule_code: str,
-    evidence: dict | None = None,
-    outcome: dict | None = None,
+    evidence: dict[str, Any] | None = None,
+    outcome: dict[str, Any] | None = None,
     model: str | None = None,
     tokens_in: int = 0,
     tokens_out: int = 0,
@@ -85,6 +89,11 @@ def registrar(
                     "tokens_out": tokens_out,
                     "cost_cents": cost_cents,
                     "parent_id": parent_id,
+                    # Carimbado aqui, nao pelo default da coluna: ver
+                    # `agent_ops.tempo`. O default do banco resolve no fuso da
+                    # sessao do Postgres e em UTC no SQLite, entao depender
+                    # dele faz o mesmo DDL gravar coisas diferentes.
+                    "created_at": agora_utc(),
                 },
             )
     except Exception:
