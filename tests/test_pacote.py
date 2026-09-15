@@ -6,6 +6,8 @@ para quebrar, porque import com efeito colateral transforma `pytest --collect`
 e o `--help` da app em chamada de rede.
 """
 
+import pathlib
+
 import pytest
 from pydantic import ValidationError
 
@@ -13,16 +15,39 @@ import agent_ops
 from agent_ops.config import Config, get_config
 
 
-def test_versao_exposta():
-    assert agent_ops.__version__ == "0.2.0"
+def test_versao_exposta_bate_com_a_declarada():
+    """O numero do `pyproject.toml` e o que o pacote instalado reporta.
+
+    Antes isto comparava com um literal, o que reintroduzia o numero num
+    TERCEIRO lugar e quebrava a cada bump: exatamente o defeito que o teste
+    logo abaixo existe para impedir, so que dentro da suite.
+
+    A propriedade util nao e "a versao e 0.3.0", e "o que esta declarado e o
+    que chega em quem importa". Isso pega dois erros de verdade: subir a versao
+    no pyproject e esquecer de reinstalar (o editable install continua
+    reportando o metadado velho, e ai a suite mede a versao errada), e um build
+    que empacote metadado divergente do fonte.
+    """
+    import tomllib
+
+    # Ancorado no proprio arquivo de teste (tests/ fica na raiz), e nao em
+    # `agent_ops.__file__`: o caminho ate o pacote muda entre install editavel
+    # e wheel, e um `parents[n]` errado vira skip silencioso em vez de falha.
+    raiz = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert raiz.is_file(), f"nao achei o pyproject.toml em {raiz}"
+
+    declarada = tomllib.loads(raiz.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert agent_ops.__version__ == declarada, (
+        f"o pacote reporta {agent_ops.__version__} e o pyproject declara "
+        f"{declarada}; reinstale (`pip install -e .`) ou alinhe os dois"
+    )
 
 
 def test_a_versao_tem_fonte_unica():
     # Ate a v0.1.1 o numero estava escrito em dois lugares e eles divergiram: a
     # tag dizia 0.1.1 e o metadado dizia 0.1.0. Este teste falha se alguem
     # reintroduzir o literal no __init__.
-    import pathlib
-
     fonte = (
         pathlib.Path(agent_ops.__file__).read_text(encoding="utf-8")
     )
