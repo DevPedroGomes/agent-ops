@@ -11,12 +11,17 @@ justamente onde elas podem quebrar.
    vale se reservar, checar e desfazer forem indivisiveis de verdade. Isso e
    propriedade do servidor, nao do cliente, e so aparece sob concorrencia
    real, que num dublê sequencial nao existe.
+3. O `pcall` DO EXPIRE. O modelo em Python engole a falha do TTL por conta
+   propria, entao trocar `redis.pcall` por `redis.call` no script nao quebrava
+   nenhum teste rapido. Os dois testes de falha no TTL daqui fazem o EXPIRE
+   errar dentro do script de verdade.
 
 Rodar: `AGENT_OPS_TEST_REDIS_URL=redis://localhost:6379/15 pytest`.
 Sem a variavel, tudo aqui e skip.
 """
 
 import asyncio
+import logging
 
 import pytest
 
@@ -132,3 +137,72 @@ def test_fechar_solta_o_cliente_de_verdade(em_redis):
         return cotas._cliente
 
     assert em_redis(cenario) is None
+
+
+def _ttl_invalido(monkeypatch):
+    """Faz o EXPIRE do script falhar no servidor, sem mexer no servidor.
+
+    `consumir` manda `str(_TTL_SEGUNDOS)` como ARGV[3]. Com "x" ali, o EXPIRE
+    responde "value is not an integer or out of range" dentro do Lua, depois
+    de o INCRBY ja ter escrito. E a mesma forma da falha original: o
+    incremento vale e a faxina que vem em seguida erra.
+    """
+    monkeypatch.setattr(cotas, "_TTL_SEGUNDOS", "x")
+
+
+def test_ttl_que_falha_dentro_do_script_nao_recusa_a_chamada(
+    em_redis, monkeypatch, caplog
+):
+    """Regressao do bug do EXPIRE, contra o script de verdade.
+
+    Com `redis.call` no EXPIRE, o script aborta depois do INCRBY, o Redis nao
+    desfaz o incremento e `consumir` levanta `TetoIndisponivel`: a chamada e
+    recusada e a cota fica cobrada. Com `redis.pcall`, a reserva fica de pe e
+    so o TTL se perde.
+    """
+    _ttl_invalido(monkeypatch)
+
+    async def cenario(cliente):
+        restante = await metering.consumir("chat", limite=10)
+        chave = cotas._chave("chat")
+        return restante, await cliente.get(chave), await cliente.ttl(chave)
+
+    with caplog.at_level(logging.WARNING, logger=cotas.__name__):
+        restante, contador, ttl = em_redis(cenario)
+
+    assert restante == 9, "a chamada foi recusada por causa do TTL"
+    assert contador == "1", "a reserva nao ficou de pe"
+    # -1 e "a chave existe e nao expira": prova que o EXPIRE errou de verdade
+    # no servidor, e que o teste nao passou pelo caminho feliz.
+    assert ttl == -1
+    # O log e o que `ttl_ok=0` vindo do script produz em `consumir`.
+    assert "metering.ttl_nao_aplicado" in caplog.text
+
+
+def test_recusa_com_ttl_falhando_dentro_do_script_nao_cobra_cota(
+    em_redis, monkeypatch, caplog
+):
+    """Teto estourado e EXPIRE com erro na mesma chamada.
+
+    A compensacao tem que acontecer mesmo com o TTL falhando no meio do
+    script. Se o EXPIRE abortasse o script, ela nunca rodaria e o contador
+    ficaria inflado ate a virada do dia.
+    """
+
+    async def cenario(cliente):
+        await metering.consumir("chat", limite=5, unidades=5)
+        _ttl_invalido(monkeypatch)
+        with pytest.raises(metering.TetoAtingido) as recusa:
+            await metering.consumir("chat", limite=5, unidades=1)
+        return recusa.value, await cliente.get(cotas._chave("chat"))
+
+    with caplog.at_level(logging.WARNING, logger=cotas.__name__):
+        recusa, contador = em_redis(cenario)
+
+    # Tipo exato: `TetoIndisponivel` tambem e `TetoAtingido`, e e ele que sobe
+    # quando o script aborta no EXPIRE.
+    assert type(recusa) is metering.TetoAtingido, (
+        f"recusou como {type(recusa).__name__}, nao por teto"
+    )
+    assert contador == "5", f"a chamada recusada cobrou cota: contador em {contador}"
+    assert "metering.ttl_nao_aplicado" in caplog.text
