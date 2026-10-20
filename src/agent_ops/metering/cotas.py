@@ -18,11 +18,11 @@ Decisoes, todas herdadas do `budget.py` do BrainHub:
   cota, que e a unica coisa que este modulo existe para impedir.
 - Se o Redis nao responde, RECUSA. Um teto ilegivel nao e um teto ausente —
   mas o tipo levantado e `TetoIndisponivel`, para o chamador separar 503 de 429.
-- O kill switch e configuracao de ambiente, para estancar sem redeploy. Ele e
-  parada deliberada, nao falha de backend: continua `TetoAtingido` puro. E lido
-  a CADA chamada (`kill_switch_ligado`), nao pelo cache de `get_config` — um
-  freio de emergencia que so pega depois de reiniciar o processo nao e freio de
-  emergencia.
+- O kill switch e configuracao de ambiente, para estancar sem rebuild nem
+  deploy de codigo. Ele e parada deliberada, nao falha de backend: continua
+  `TetoAtingido` puro. E lido a CADA chamada (`kill_switch_ligado`), nao pelo
+  cache de `get_config`. De fora do processo, ligar a env ainda exige
+  reinicia-lo: ver o docstring de `kill_switch_ligado`.
 
 O que mudou na extracao: a chave ganhou `projeto` (dois apps no mesmo Redis
 dividiriam o teto um do outro) e `escopo` opcional (teto por IP convivendo com

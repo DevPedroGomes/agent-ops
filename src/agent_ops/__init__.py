@@ -15,9 +15,9 @@ precisa da fila nao arrasta SQLAlchemy junto" — o que nunca foi verdade, e um
 docstring que mente sobre uma propriedade e pior que a ausencia dele.
 
 Um dia da para carregar `execucao` so quando ele for tocado (`__getattr__` de
-modulo, PEP 562), e ai quem so enfileira nao paga o ORM. Nao vale a indirecao
-numa v0.1.0: o custo e um import, o risco e um caminho de resolucao de nome que
-so quebra em producao.
+modulo, PEP 562), e ai quem so enfileira nao paga o ORM. Por enquanto a
+indirecao nao se paga: o custo e um import, o risco e um caminho de resolucao
+de nome que so quebra em producao.
 """
 
 from importlib.metadata import version as _version

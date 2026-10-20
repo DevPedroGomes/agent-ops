@@ -83,9 +83,13 @@ def kill_switch_ligado() -> bool:
 
     `get_config` e `lru_cache(maxsize=1)`: a env e lida uma vez por processo e
     congela. Isso esta certo para `redis_url` e `projeto`, que nao mudam com o
-    servico em pe — e errado exatamente para o freio de emergencia. Um operador
-    ligando `AGENT_OPS_KILL_SWITCH` no container em pe via o gasto continuar,
-    enquanto o comentario do campo e o README prometiam "sem redeploy".
+    servico em pe. Para o kill switch, ler a cada chamada faz qualquer mudanca
+    em `os.environ` feita DENTRO do processo valer na chamada seguinte.
+
+    De FORA, ninguem muda o ambiente de um processo que ja esta rodando. Ligar
+    a env num servico em pe exige reiniciar o processo com o valor novo (num
+    container, recria-lo: `docker restart` mantem o ambiente antigo). Nao exige
+    rebuild de imagem nem deploy de codigo.
 
     Um `os.getenv` por chamada nao custa nada perto do round trip ao Redis que
     vem logo depois, entao nao ha motivo para cachear.

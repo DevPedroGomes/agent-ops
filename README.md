@@ -1,5 +1,8 @@
 # agent-ops
 
+[![CI](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Operational primitives for LLM agents that run in production: a spend cap that
 refuses when it cannot read itself, an append-only decision trail that answers
 "why did it decide that" with a rule code, and a durable job queue that does not
@@ -14,9 +17,14 @@ The extraction found a bug that was in production at the time; see
 [Design decisions](#design-decisions).
 
 * Python 3.12 or newer
-* 1900 lines of source, 192 tests, no infrastructure needed to run them
+* 1900 lines of source and 194 tests. 176 of them run without Redis, a
+  database or the network. The other 18 run against real services, 8 against
+  PostgreSQL and 10 against Redis, and are skipped unless
+  `AGENT_OPS_TEST_POSTGRES_URL` and `AGENT_OPS_TEST_REDIS_URL` are set
 * Redis for metering and the queue, PostgreSQL for the trail and job progress
-* [How it was built](docs/como-foi-construido.md), including the defects found
+* Installed from GitHub by tag. It is not published on PyPI
+* MIT licensed
+* [How it was built](docs/how-it-was-built.md), including the defects found
   along the way
 
 ## Contents
@@ -33,11 +41,14 @@ The extraction found a bug that was in production at the time; see
 * [Testing](#testing)
 * [Known limitations](#known-limitations)
 * [Versioning](#versioning)
+* [License](#license)
 
 ## Install
 
+The package is not on PyPI. Install it from this repository, pinned to a tag:
+
 ```bash
-pip install "git+https://github.com/DevPedroGomes/agent-ops.git@v0.3.0"
+pip install "git+https://github.com/DevPedroGomes/agent-ops@v0.3.0"
 ```
 
 Pinned by tag on purpose. A dependency that tracks `main` breaks your production
@@ -85,7 +96,7 @@ ignored, because the host has dozens that are none of this package's business.
 | `AGENT_OPS_REDIS_URL` | `redis://localhost:6379` | Metering and queue backend |
 | `AGENT_OPS_PROJETO` | `default` | Namespaces every Redis key and job id |
 | `AGENT_OPS_PROFUNDIDADE_MAXIMA` | `500` | Queue depth above which enqueueing is refused |
-| `AGENT_OPS_KILL_SWITCH` | `false` | Stops all paid calls, read live on every call |
+| `AGENT_OPS_KILL_SWITCH` | `false` | Stops all paid calls, read from the process environment on every call |
 
 Three of these are load-bearing in ways that are easy to miss.
 
@@ -102,8 +113,14 @@ into the same one. That collision does not raise; it silently merges the spend
 cap of two projects, or hands one tenant another tenant's job.
 
 `AGENT_OPS_KILL_SWITCH` is read with `os.getenv` on every call rather than
-through the cached settings object. A cached emergency brake engages only after
-a process restart, which is not what an emergency brake is for.
+through the cached settings object. That call sees the environment of the
+running process, and nothing outside the process can change that environment
+after it starts. Engaging the switch on a deployed service therefore means
+setting the variable and restarting the process. For a container that means
+recreating it with the new value, since `docker restart` keeps the old
+environment. No image rebuild and no code change are needed. Code inside the
+process that assigns `os.environ["AGENT_OPS_KILL_SWITCH"]` takes effect on the
+next call, which the cached settings object would not allow.
 
 Nothing connects at import time. Clients are created on the first call, so
 importing the package in a test, a migration script or a CLI opens no sockets.
@@ -229,8 +246,8 @@ page, and a handler reading `p["remaining"]` would raise `KeyError` exactly when
 the backend is unreachable. When `degraded` is true, the counters read zero
 because the real values are unknown, not because quota is exhausted.
 
-The kill switch is read live here too, so the health endpoint cannot report
-"running" while `consumir` is already refusing.
+The kill switch is read the same way here, on every call, so the health
+endpoint cannot report "running" while `consumir` is already refusing.
 
 ---
 
@@ -627,9 +644,12 @@ A production bug found during extraction. The original spend cap had `INCR` and
 `EXPIRE` inside the same `try`. If `INCR` succeeded and `EXPIRE` then failed, a
 transient blip between two round trips, execution fell into the generic handler
 and raised without undoing the increment. A refused call charged the next
-visitor's quota. The fix separates the two error scopes: the TTL is
-housekeeping, not correctness, so a failure there logs and continues. There is a
-regression test that reproduces the original bug.
+visitor's quota. The first fix separated the two error scopes: the TTL is
+housekeeping, not correctness, so a failure there logs and continues. Since
+0.3.0 the increment, the TTL and the compensation run in one Lua script, where
+`EXPIRE` goes through `redis.pcall` so that its error cannot abort the script
+after the increment is written. Two tests against a real Redis make `EXPIRE`
+fail inside that script, and both fail if `pcall` is replaced with `call`.
 
 Subpackages do not import each other. `metering` pulls no SQLAlchemy. A test
 pins the actual import cost of each subpackage, including the one case where the
@@ -692,16 +712,17 @@ explicitly. A job stuck in `rodando` with a stale timestamp is exactly what
 destroying the evidence while the work stays lost.
 
 `decisions.purgar` also takes an optional `tenant_id`, which answers a
-different question: erasure on request rather than retention by age.
-`decisions` grows per decision, not per request, so an orchestrator that spawns
-five workers writes six rows. Schedule a delete, or plan for the disk.
+different question: erasure on request rather than retention by age. Pass an
+`antes_de` later than the tenant's newest row, such as the current time, and
+loop until it returns zero.
 
-The Redis client is a process-level singleton created on first use and never
-closed. On a normal service that is correct and cheap. It matters in two places:
-a process that runs more than one event loop over its lifetime, such as a script
-calling `asyncio.run` twice, will find the client bound to the first loop; and
-there is no explicit shutdown, so an interpreter exiting under load may log an
-unclosed-connection warning.
+The Redis client is a process-level singleton created on first use. It stays
+open until `metering.fechar()` closes it, as described under
+[Shutdown](#shutdown). A service that never calls `fechar` works, with two
+costs: a process that runs more than one event loop over its lifetime, such as
+a script calling `asyncio.run` twice, finds the client bound to the first loop
+unless `fechar` runs in between, and an interpreter exiting under load may log
+an unclosed-connection warning.
 
 Queue depth counts every job in arq's sorted set, which includes deferred jobs
 and jobs waiting out a retry backoff. During a provider outage, retrying jobs
@@ -735,12 +756,14 @@ the caller. The progress table has no tenant column to catch it for you.
 
 ## Testing
 
-95 tests, no Redis, no PostgreSQL, no network, no provider key. Async functions
-are tested with `asyncio.run()` and hand-written doubles rather than a plugin, to
-avoid adding a test dependency the consuming applications do not already have.
+194 tests. 176 of them run with no Redis, no PostgreSQL, no network and no
+provider key. Async functions are tested with `asyncio.run()` and hand-written
+doubles rather than a plugin, to avoid adding a test dependency the consuming
+applications do not already have.
 
-The suite runs in under a second, which matters more than it sounds: a test
-suite that needs infrastructure is a test suite that gets skipped.
+Those 176 run in under a second, which matters more than it sounds: a test
+suite that needs infrastructure is a test suite that gets skipped. The other
+18 need real services and are described below.
 
 ```bash
 pip install -e ".[dev]"
@@ -754,26 +777,33 @@ worth the cost in a package other code imports: without it the annotations
 serve the reader and not the caller, and `py.typed` would export promises
 nobody checks.
 
-CI does two things. It runs the suite, and it builds a wheel and installs it
-into a clean virtualenv, asserting that the packaged `.sql` files are present.
-An editable install resolves those from the source tree regardless, so without
-that second job the package could stop being installable with CI fully green.
+CI runs three jobs: the full suite against real PostgreSQL and Redis, `ruff`
+and `mypy`, and a wheel build installed into a clean virtualenv that asserts
+the packaged `.sql` files and `py.typed` are present. An editable install
+resolves those from the source tree regardless, so without the wheel job the
+package could stop being installable with CI fully green.
 
 A dedicated test pins the public surface of all three subpackages. The consuming
 application migrates by changing an import line, so a silent rename from
 `consumir` to `consume` has to break here rather than at someone's deploy.
 
-Two more files run the same code against real PostgreSQL and real Redis, and
-skip when `AGENT_OPS_TEST_POSTGRES_URL` and `AGENT_OPS_TEST_REDIS_URL` are
-unset, so the fast path stays fast. CI sets both and fails if those tests skip,
-because a typo in a variable name would turn that whole coverage into a silent
-pass.
+Two more files run the same code against real PostgreSQL (8 tests) and real
+Redis (10 tests), and skip when `AGENT_OPS_TEST_POSTGRES_URL` and
+`AGENT_OPS_TEST_REDIS_URL` are unset, so the fast path stays fast. CI sets both
+and fails if those tests skip, because a typo in a variable name would turn
+that whole coverage into a silent pass.
 
 The Redis file exists because the double cannot execute Lua and cannot be
 concurrent. What runs in the fast suite is a model of the reservation script;
 the real file runs the script. It also runs the test a sequential double can
 never perform: 50 simultaneous reservations against a cap of 10. With a
 non-atomic check-then-reserve, all 50 get through.
+
+It also makes `EXPIRE` fail inside the script, by sending a TTL the server
+rejects, and checks that the reservation stands and that a refused call is
+still compensated. The fast suite cannot cover this. Its model of the script
+swallows the `EXPIRE` error on its own, so replacing `redis.pcall` with
+`redis.call` in the script left every fast test green.
 
 That fixture pins the session time zone to `America/Bahia` on purpose. The
 official PostgreSQL image boots in UTC, and in UTC the defect these tests exist
@@ -814,9 +844,11 @@ new day's key, where it is floored at zero rather than credited. The refund is
 lost, which is the documented best-effort behavior for `devolver`, but it can
 no longer raise anyone's cap.
 
-The trail has no tenant-scoped delete. `contagem_por_regra` is the only query
-that crosses tenants, and it returns counts rather than rows, but a data
-subject erasure request still means writing the `DELETE` yourself.
+Erasure on request covers the decision trail only. `decisions.purgar` takes a
+`tenant_id`, while `queue.purgar` has no tenant filter because `job_progress`
+has no tenant column. The tenant is the middle field of the job id
+(`projeto:tenant:digest`), so removing one tenant's progress rows means a
+`DELETE` on `job_id` that you write yourself.
 
 No fair-share scheduling. One tenant can occupy the whole worker pool. arq has
 no native support for it, and doing it properly means per-tenant queues and a
@@ -848,3 +880,9 @@ configuration, which is the one place the "names are preserved" guarantee does
 not hold.
 
 Pin the tag. Read the diff before moving it.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE).

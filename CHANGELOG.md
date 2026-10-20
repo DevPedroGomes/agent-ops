@@ -3,6 +3,55 @@
 Tag-pinned installs are the only supported way to consume this package, so
 every entry here is something that changes what a pinned upgrade does to you.
 
+## [Unreleased]
+
+No change to runtime behavior. The version stays 0.3.0 until a release is cut.
+
+### Added
+
+* **MIT license.** `LICENSE` at the root, declared in `pyproject.toml` as a
+  PEP 639 expression (`license = "MIT"`, `license-files = ["LICENSE"]`).
+* **Package metadata.** An English `description`, `authors`, `readme`,
+  `classifiers` (Python 3.12, typed) and `[project.urls]` with the homepage,
+  repository, changelog and issue tracker. There is no license classifier,
+  because setuptools refuses a build that has both a license expression and a
+  license classifier.
+* **Regression tests for the `EXPIRE` failure against a real Redis.** The
+  existing tests for this failure ran on the Python model of the Lua script,
+  which swallows the error by itself, so replacing `redis.pcall` with
+  `redis.call` in the script left every test green. Two tests in
+  `tests/test_portabilidade_redis.py` now make `EXPIRE` fail inside the real
+  script. One checks that the reservation stands and the call is not refused,
+  the other that a refused call is still compensated. Both fail with `call`,
+  and the second also fails when the compensation is removed from the script.
+
+### Changed
+
+* The build requires `setuptools>=77`, the first series that accepts a PEP 639
+  license expression. Installs from git build in an isolated environment that
+  fetches it, so consumers need no action.
+* `docs/como-foi-construido.md`, an implementation plan in Portuguese, is
+  replaced by `docs/how-it-was-built.md`: a short English account of where the
+  package came from, its design decisions and the defects found.
+
+### Fixed (documentation)
+
+* The README said the tests needed no infrastructure. 176 of them run without
+  Redis, a database or the network, and 18 run against a real PostgreSQL (8)
+  and Redis (10), skipping when their variables are unset. A second count in
+  the Testing section still said 95.
+* The README said `AGENT_OPS_KILL_SWITCH` takes effect without a restart. It is
+  read from the process environment on every call, and a running process's
+  environment cannot be changed from outside, so engaging it on a deployed
+  service means restarting the process with the variable set.
+* The README said the Redis client is never closed and has no explicit
+  shutdown, while documenting `metering.fechar` elsewhere.
+* The README listed "no tenant-scoped delete" as a limitation, while
+  `decisions.purgar(tenant_id=...)` exists. The limitation that remains is
+  that `queue.purgar` has no tenant filter.
+* The README states that the package is installed from GitHub by tag and is
+  not on PyPI, and carries CI and license badges.
+
 ## 0.3.0
 
 ### Fixed

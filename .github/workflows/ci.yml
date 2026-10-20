@@ -91,8 +91,9 @@ jobs:
   # `pip install -e` resolve os dois `.sql` a partir da arvore de fontes de
   # qualquer jeito, entao o job acima NAO prova que eles viajam dentro do
   # artefato — ele passaria verde com o `package-data` do pyproject.toml
-  # apagado, e o `pip install git+ssh://` (a unica forma de consumo deste
-  # pacote) quebraria com FileNotFoundError no boot da app. Este job constroi a
+  # apagado, e o `pip install "git+https://...@<tag>"` (a forma de instalar
+  # documentada no README, ja que o pacote nao esta no PyPI) quebraria com
+  # FileNotFoundError no boot da app. Este job constroi a
   # wheel e a instala num venv limpo, fora da arvore de fontes, que e onde a
   # diferenca aparece.
   wheel:
