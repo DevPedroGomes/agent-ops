@@ -224,6 +224,11 @@ def test_falha_no_ttl_nao_recusa_a_chamada(monkeypatch):
     # O TTL e faxina, nao corretude. Recusar por causa dele seria ruim; recusar
     # SEM devolver o incremento — que era o comportamento herdado do budget.py
     # original — cobra cota de uma chamada que nunca aconteceu.
+    #
+    # Aqui o EXPIRE falha no MODELO do script, que engole o erro sozinho: este
+    # teste continua verde com `redis.call` no lugar do `redis.pcall`. Quem
+    # prende o `pcall` sao os testes de falha no TTL em
+    # `test_portabilidade_redis.py`, que fazem o EXPIRE errar no servidor.
     monkeypatch.setenv("AGENT_OPS_PROJETO", "testes")
     monkeypatch.setenv("AGENT_OPS_KILL_SWITCH", "false")
     fake = FakeRedis(falha_no_expire=True)
