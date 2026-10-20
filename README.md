@@ -564,58 +564,194 @@ to customers rather than to operators.
 
 ## API reference
 
-Everything below is re-exported from its subpackage, so
-`from agent_ops import metering, decisions, queue` reaches all of it.
+The identifiers are in Portuguese and are not translated, so each table gives
+the English meaning of every name next to it: `consumir` means consume quota,
+`enfileirar` means enqueue, `marcar` means mark progress. Everything below is
+re-exported from its subpackage, so `from agent_ops import metering, decisions,
+queue` reaches all of it. The signatures match the source, with the
+`LIMITE_PADRAO` and `LOTE_PADRAO` defaults written out as 50 and 1000.
+
+"Never" in the Raises column means a backend failure is logged and swallowed.
+Database errors are SQLAlchemy's own exceptions, and Redis errors are
+redis-py's.
 
 ### `agent_ops.metering`
 
-| Name | Signature | Raises |
-|---|---|---|
-| `consumir` | `async (tipo, limite, unidades=1, escopo=None) -> int` | `TetoAtingido`, `TetoIndisponivel`, `ValueError` |
-| `devolver` | `async (tipo, unidades=1, escopo=None) -> None` | `ValueError` only |
-| `panorama` | `async (limites: dict[str, int], escopo=None) -> dict` | never |
-| `fechar` | `async () -> None`, closes the client | never |
-| `segundos_ate_meia_noite_utc` | `() -> int` | never |
-| `TetoAtingido` | `Exception` with `.mensagem` | |
-| `TetoIndisponivel` | subclass of `TetoAtingido` | |
+```python
+async def consumir(tipo: str, limite: int, unidades: int = 1,
+                   escopo: str | None = None) -> int: ...
+async def devolver(tipo: str, unidades: int = 1,
+                   escopo: str | None = None) -> None: ...
+async def panorama(limites: dict[str, int],
+                   escopo: str | None = None) -> dict[str, Any]: ...
+async def fechar() -> None: ...
+def segundos_ate_meia_noite_utc() -> int: ...
+
+class TetoAtingido(Exception):            # .mensagem: str
+    def __init__(self, mensagem: str): ...
+class TetoIndisponivel(TetoAtingido): ...
+```
+
+| Name | Meaning | What it does | Raises |
+|---|---|---|---|
+| `consumir` | consume quota | Reserves `unidades` of today's `tipo` quota, per `escopo` when given, before the paid call. Returns the units left | `TetoAtingido` at the cap or with the kill switch on, `TetoIndisponivel` when Redis is unreadable, `ValueError` for `unidades <= 0` or a `:` in `tipo`. A refused call charges nothing |
+| `devolver` | refund quota | Gives units back when the paid call did not happen. Best effort, and never takes the counter below zero | `ValueError` for `unidades <= 0` or a `:` in `tipo`. Never on a backend failure |
+| `panorama` | overview | Today's usage for a health check, with the keys `date`, `escopo`, `kill_switch`, `degraded`, `used`, `limits` and `remaining` | Never. With Redis down it returns the same shape, `degraded: True` and zeroed counters |
+| `fechar` | close | Closes the Redis client at shutdown and releases the singleton; the next call opens a new one | Never |
+| `segundos_ate_meia_noite_utc` | seconds until UTC midnight | The value for `Retry-After` when the cap is hit, never below 1 | Never |
+| `TetoAtingido` | cap reached | Exception with a message safe to show the visitor in `.mensagem`. Answer 429 | |
+| `TetoIndisponivel` | cap unavailable | Subclass of `TetoAtingido` for an unreadable backend. Answer 503, and catch it first | |
+| `cotas` | quotas | The module that implements everything above | |
+
+```python
+left = await metering.consumir("pdf", limite=1_000, unidades=page_count)
+await metering.consumir("chat", limite=20, escopo=f"ip:{client_ip}")
+```
 
 ### `agent_ops.decisions`
 
-| Name | Signature | Raises |
-|---|---|---|
-| `digerir` | `(payload: str \| bytes) -> str` | |
-| `registrar` | `(engine, *, tenant_id, correlation_id, input_digest, rule_code, evidence=None, outcome=None, model=None, tokens_in=0, tokens_out=0, cost_cents=0, parent_id=None) -> str \| None` | never |
-| `listar` | `(engine, *, tenant_id, limite=50, antes_de=None) -> list[dict]` | on a broken engine, `ValueError` |
-| `por_execucao` | `(engine, *, tenant_id, correlation_id, limite=500) -> list[dict]` | on a broken engine, `ValueError` |
-| `filhos` | `(engine, *, tenant_id, parent_id, limite=500) -> list[dict]` | on a broken engine, `ValueError` |
-| `contagem_por_regra` | `(engine, *, desde=None) -> dict[str, int]` | on a broken engine |
-| `purgar` | `(engine, *, antes_de, tenant_id=None, limite=1000) -> int` | on a broken engine, `ValueError` |
-| `migracao.aplicar` | `(engine) -> None` | on a broken engine |
-| `migracao.SQL_SCHEMA` | `str`, the packaged DDL | |
+```python
+def digerir(payload: str | bytes) -> str: ...
+def registrar(
+    engine: Engine, *, tenant_id: str, correlation_id: str, input_digest: str,
+    rule_code: str, evidence: dict[str, Any] | None = None,
+    outcome: dict[str, Any] | None = None, model: str | None = None,
+    tokens_in: int = 0, tokens_out: int = 0, cost_cents: int = 0,
+    parent_id: str | None = None,
+) -> str | None: ...
+def listar(engine: Engine, *, tenant_id: str, limite: int = 50,
+           antes_de: datetime | None = None) -> list[dict[str, Any]]: ...
+def por_execucao(engine: Engine, *, tenant_id: str, correlation_id: str,
+                 limite: int = 500) -> list[dict[str, Any]]: ...
+def filhos(engine: Engine, *, tenant_id: str, parent_id: str,
+           limite: int = 500) -> list[dict[str, Any]]: ...
+def contagem_por_regra(engine: Engine, *,
+                       desde: datetime | None = None) -> dict[str, int]: ...
+def purgar(engine: Engine, *, antes_de: datetime, tenant_id: str | None = None,
+           limite: int = 1000) -> int: ...
+
+# agent_ops.decisions.migracao
+def aplicar(engine: Engine) -> None: ...
+SQL_SCHEMA: str
+```
+
+| Name | Meaning | What it does | Raises |
+|---|---|---|---|
+| `digerir` | digest | SHA-256 hex of the input. A `str` is encoded as UTF-8 first, so the same content as text and as bytes gives the same digest | |
+| `registrar` | record | Appends one row to the trail under the configured project, stamped in UTC. Returns the new row id, or `None` when the write failed | Never |
+| `listar` | list | The tenant's decisions, newest first. To page, pass the last `created_at` you saw as `antes_de` | Database errors, `ValueError` for `limite <= 0` |
+| `por_execucao` | by run | Every decision of one run (`correlation_id`) within the tenant, oldest first | Database errors, `ValueError` for `limite <= 0` |
+| `filhos` | children | The decisions whose `parent_id` is the given id, one level deep | Database errors, `ValueError` for `limite <= 0` |
+| `contagem_por_regra` | count per rule | `{rule_code: count}` for the configured project, since `desde` when given. Counts only, no rows | Database errors |
+| `purgar` | purge | Deletes up to `limite` rows older than `antes_de`, for one tenant when `tenant_id` is given. Returns how many went; loop until it returns 0 | Database errors, `ValueError` for `limite <= 0` |
+| `migracao.aplicar` | apply | Creates the `decisions` table and its indexes. Idempotent, safe on every boot | Database errors |
+| `migracao.SQL_SCHEMA` | | The packaged DDL, as text | |
+| `consultas`, `registro`, `migracao` | queries, recording, migration | The modules behind the functions above | |
+
+The reads return one dict per row with every column, and `evidence` and
+`outcome` parsed back into dicts. `antes_de` and `desde` are naive UTC
+datetimes, the same as what is stored.
+
+```python
+decisions.digerir("same text") == decisions.digerir(b"same text")   # True
+```
 
 ### `agent_ops.queue`
 
-| Name | Signature | Raises |
+```python
+async def criar_pool() -> ArqRedis: ...
+async def enfileirar(pool: Pool, funcao: str, *args: Any, digest: str,
+                     tenant: str | None = None, **kwargs: Any) -> str | None: ...
+def job_id_de(digest: str, tenant: str | None = None) -> str: ...
+async def profundidade(pool: Pool) -> int: ...
+
+def aplicar_schema(engine: Engine) -> None: ...
+def marcar(engine: Engine, job_id: str, *, estado: str,
+           percentual: int | None = None, detalhe: str | None = None,
+           tentativas: int | None = None) -> None: ...
+def ler(engine: Engine, job_id: str) -> dict[str, Any] | None: ...
+def descartar(engine: Engine, job_id: str, *, motivo: str) -> None: ...
+def listar_por_estado(engine: Engine, estado: str, *,
+                      limite: int = 50) -> list[dict[str, Any]]: ...
+def travados(engine: Engine, *, mais_velho_que_segundos: int,
+             estado: str = "rodando",
+             limite: int = 50) -> list[dict[str, Any]]: ...
+def purgar(engine: Engine, *, antes_de: datetime,
+           estados: Iterable[str] = ESTADOS_TERMINAIS,
+           limite: int = 1000) -> int: ...
+
+def backoff(job_try: int) -> int: ...
+def tentar_de_novo(ctx: dict[str, Any]) -> None: ...
+def esgotou(ctx: dict[str, Any], max_tries: int = MAX_TENTATIVAS) -> bool: ...
+
+ESTADOS: frozenset[str]
+ESTADOS_TERMINAIS: frozenset[str]
+MAX_TENTATIVAS: int
+
+class FilaCheia(Exception):               # .mensagem: str, .retry_after: int
+    def __init__(self, mensagem: str, retry_after: int = 30): ...
+class FilaIndisponivel(FilaCheia): ...
+```
+
+`Pool` is `agent_ops.queue.fila.Pool`, a protocol that any arq pool satisfies:
+it only needs `zcard` and `enqueue_job`. `ctx` is the dict arq passes to the
+job function.
+
+| Name | Meaning | What it does | Raises |
+|---|---|---|---|
+| `criar_pool` | create pool | Opens the arq pool for the side that enqueues, from `AGENT_OPS_REDIS_URL`. Once per process | Redis connection errors |
+| `enfileirar` | enqueue | Enqueues `funcao(*args, **kwargs)` with the job id `projeto:tenant:digest`. Returns the id, or `None` when that job is already queued or running, which is success | `FilaCheia` at `AGENT_OPS_PROFUNDIDADE_MAXIMA`, `FilaIndisponivel` when Redis cannot be read or written, `ValueError` for a `:` in `tenant` or `digest` |
+| `job_id_de` | job id of | The id `enfileirar` gives this work, computed without enqueueing, so the client gets an id on the duplicate path too | `ValueError` for a `:` in `tenant` or `digest` |
+| `profundidade` | depth | How many jobs wait in the pool's own queue | Redis errors, untranslated |
+| `aplicar_schema` | apply schema | Creates the `job_progress` table. Idempotent; call it on web and worker boot | Database errors |
+| `marcar` | mark | Upserts a job's progress. An omitted `percentual`, `detalhe` or `tentativas` keeps the stored value | `ValueError` for a state outside `ESTADOS`. Never on a database failure |
+| `ler` | read | The job's progress row, or `None` when it was never marked | Never. A failed read also returns `None` |
+| `descartar` | discard | Dead-letters the job: `estado="descartado"` with `motivo` as `detalhe`, keeping the last `percentual` | Never |
+| `listar_por_estado` | list by state | Jobs in one state, newest first. Built for sweeping `descartado` | Database errors, `ValueError` for an unknown state or `limite <= 0` |
+| `travados` | stalled | Jobs left in `estado` for longer than `mais_velho_que_segundos`, oldest first | Database errors, `ValueError` for an unknown state, a window `<= 0` or `limite <= 0` |
+| `purgar` | purge | Deletes up to `limite` progress rows older than `antes_de` whose state is in `estados`, terminal states by default. Returns how many went; loop until it returns 0 | Database errors, `ValueError` for an empty or unknown `estados` or `limite <= 0` |
+| `backoff` | backoff | Seconds before try `job_try` runs again: 5, 10, 20, 40, and so on up to 300 | |
+| `tentar_de_novo` | try again | Hands the job back to arq with a `backoff(ctx["job_try"])` delay | Always `arq.Retry`, which is how arq receives it |
+| `esgotou` | exhausted | `True` on the last allowed try, when the caller should `descartar` instead | |
+| `ESTADOS` | states | `pendente`, `rodando`, `concluido`, `falhou`, `descartado` | |
+| `ESTADOS_TERMINAIS` | terminal states | `concluido`, `falhou`, `descartado`, the default of `purgar` | |
+| `MAX_TENTATIVAS` | max tries | `5`. Set `WorkerSettings.max_tries` to this constant | |
+| `FilaCheia` | queue full | Exception with `.mensagem` and `.retry_after` (30 by default). Answer 429 with `Retry-After` | |
+| `FilaIndisponivel` | queue unavailable | Subclass of `FilaCheia` for a queue that cannot be read or written. Answer 503, and catch it first | |
+| `fila`, `execucao` | queue, execution | The modules behind the functions above | |
+
+```python
+queue.job_id_de(digest, tenant="acme")           # "<AGENT_OPS_PROJETO>:acme:<digest>"
+[queue.backoff(n) for n in range(1, 8)]          # [5, 10, 20, 40, 80, 160, 300]
+```
+
+### Async twins
+
+`decisions.aio` and `queue.aio` hold an `async def` for every database function,
+with the same name and signature. Each one runs the synchronous function through
+`asyncio.to_thread`, so it raises exactly what that function raises.
+
+| Module | Functions |
+|---|---|
+| `decisions.aio` | `aplicar` (the twin of `migracao.aplicar`), `registrar`, `listar`, `por_execucao`, `filhos`, `contagem_por_regra`, `purgar` |
+| `queue.aio` | `aplicar_schema`, `marcar`, `ler`, `descartar`, `listar_por_estado`, `travados`, `purgar` |
+
+```python
+from agent_ops.decisions import aio as decisions_aio
+
+rows = await decisions_aio.listar(engine, tenant_id=user_id)
+```
+
+### Package and support modules
+
+Not re-exported by a subpackage, but used in the examples above.
+
+| Name | Meaning | What it does |
 |---|---|---|
-| `criar_pool` | `async () -> ArqRedis` | on a broken Redis |
-| `enfileirar` | `async (pool, funcao, *args, digest, tenant=None, **kwargs) -> str \| None` | `FilaCheia`, `FilaIndisponivel`, `ValueError` |
-| `job_id_de` | `(digest, tenant=None) -> str` | `ValueError` |
-| `profundidade` | `async (pool) -> int` | on a broken Redis |
-| `aplicar_schema` | `(engine) -> None` | on a broken engine |
-| `marcar` | `(engine, job_id, *, estado, percentual=None, detalhe=None, tentativas=None) -> None` | `ValueError` on a bad state |
-| `ler` | `(engine, job_id) -> dict \| None` | never |
-| `listar_por_estado` | `(engine, estado, *, limite=50) -> list[dict]` | on a broken engine, `ValueError` |
-| `travados` | `(engine, *, mais_velho_que_segundos, estado="rodando", limite=50) -> list[dict]` | on a broken engine, `ValueError` |
-| `purgar` | `(engine, *, antes_de, estados=ESTADOS_TERMINAIS, limite=1000) -> int` | on a broken engine, `ValueError` |
-| `ESTADOS_TERMINAIS` | `frozenset`: concluido, falhou, descartado | |
-| `descartar` | `(engine, job_id, *, motivo) -> None` | never |
-| `backoff` | `(job_try: int) -> int` | never |
-| `tentar_de_novo` | `(ctx) -> NoReturn` | always, `arq.Retry` |
-| `esgotou` | `(ctx, max_tries=MAX_TENTATIVAS) -> bool` | never |
-| `ESTADOS` | `frozenset` of the five state names | |
-| `MAX_TENTATIVAS` | `int`, 5 | |
-| `FilaCheia` | `Exception` with `.mensagem`, `.retry_after` | |
-| `FilaIndisponivel` | subclass of `FilaCheia` | |
+| `agent_ops.__version__` | | The installed version, read from the package metadata |
+| `agent_ops.config.get_config() -> Config` | get config | The settings from [Configuration](#configuration), read once and cached |
+| `agent_ops.config.kill_switch_ligado() -> bool` | kill switch on | Reads `AGENT_OPS_KILL_SWITCH` on every call, bypassing the cache |
+| `agent_ops.tempo.agora_utc() -> datetime` | now in UTC | The current time as a naive UTC `datetime`, the clock behind every stored timestamp |
 
 ---
 

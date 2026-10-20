@@ -2,8 +2,7 @@
 
 CONTRATO CENTRAL: `registrar` nunca levanta. A trilha e observabilidade — uma
 linha perdida e ruim, mas derrubar a resposta que o visitante ja estava
-recebendo por causa de um INSERT e pior. E o mesmo contrato que o BrainHub ja
-prende em teste hoje.
+recebendo por causa de um INSERT e pior.
 """
 
 from __future__ import annotations

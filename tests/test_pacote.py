@@ -58,13 +58,13 @@ def test_a_versao_tem_fonte_unica():
 
 def test_config_le_do_ambiente(monkeypatch):
     monkeypatch.setenv("AGENT_OPS_REDIS_URL", "redis://exemplo:6379")
-    monkeypatch.setenv("AGENT_OPS_PROJETO", "brainhub")
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "demo")
 
     cfg = get_config()
 
     assert isinstance(cfg, Config)
     assert cfg.redis_url == "redis://exemplo:6379"
-    assert cfg.projeto == "brainhub"
+    assert cfg.projeto == "demo"
     assert cfg.kill_switch is False
 
 
@@ -100,6 +100,6 @@ def test_projeto_com_dois_pontos_e_recusado(monkeypatch):
 
 
 def test_projeto_sem_dois_pontos_continua_valendo(monkeypatch):
-    monkeypatch.setenv("AGENT_OPS_PROJETO", "brainhub")
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "demo")
 
-    assert get_config().projeto == "brainhub"
+    assert get_config().projeto == "demo"

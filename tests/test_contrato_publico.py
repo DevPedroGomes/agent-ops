@@ -1,8 +1,8 @@
 """Prende a superficie publica do pacote.
 
-Por que existe: a fase 2 troca a linha de import do BrainHub para apontar aqui.
-Se um rename silencioso mudar `consumir` para `consume`, o BrainHub quebra no
-deploy, nao no CI. Este teste faz a quebra acontecer aqui.
+Por que existe: a app hospedeira migra trocando uma linha de import para apontar
+aqui. Se um rename silencioso mudar `consumir` para `consume`, quem consome
+quebra no deploy, nao no CI. Este teste faz a quebra acontecer aqui.
 
 Prende tambem o custo de import de CADA subpacote — o real, nao o desejado.
 `metering` e livre de SQLAlchemy e de arq. `queue` carrega SQLAlchemy porque a
@@ -16,7 +16,7 @@ import importlib
 import sys
 
 
-def test_metering_expoe_os_nomes_que_o_brainhub_usa():
+def test_metering_expoe_os_nomes_que_a_app_hospedeira_usa():
     import agent_ops.metering as m
 
     for nome in (

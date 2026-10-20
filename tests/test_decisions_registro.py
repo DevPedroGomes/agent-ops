@@ -3,7 +3,7 @@
 O que se prende aqui:
 - gravar a trilha NUNCA derruba o chamador. A trilha e observabilidade; perder
   uma linha e ruim, perder a resposta que o visitante ja estava recebendo e
-  pior. Este e o mesmo contrato do BrainHub atual;
+  pior;
 - o digest e estavel: a mesma entrada da sempre o mesmo hash, senao a
   deduplicacao da fila (Task 6) nao funciona;
 - `evidence` e `outcome` viajam como JSON e voltam como dict;
