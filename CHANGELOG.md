@@ -33,6 +33,17 @@ No change to runtime behavior. The version stays 0.3.0 until a release is cut.
 * `docs/como-foi-construido.md`, an implementation plan in Portuguese, is
   replaced by `docs/how-it-was-built.md`: a short English account of where the
   package came from, its design decisions and the defects found.
+* **The API reference in the README is complete and in English.** It lists
+  every name the three subpackages export, with the signature as written in
+  the source, the English meaning of each Portuguese identifier, what it does,
+  what it raises and short examples. It also covers the `aio` twins and the
+  support functions the examples use (`config.get_config`,
+  `config.kill_switch_ligado`, `tempo.agora_utc`). The identifiers themselves
+  are unchanged.
+* Comments, docstrings and test fixtures no longer name the application the
+  package was extracted from, and describe it generically instead. The
+  example project in the tests is now `demo`, and one test function was
+  renamed. No runtime code, public name or Redis key changed.
 
 ### Fixed (documentation)
 
@@ -51,6 +62,9 @@ No change to runtime behavior. The version stays 0.3.0 until a release is cut.
   that `queue.purgar` has no tenant filter.
 * The README states that the package is installed from GitHub by tag and is
   not on PyPI, and carries CI and license badges.
+* The API reference gave `queue.tentar_de_novo` a `NoReturn` return type. The
+  code annotates it `-> None`; it always raises `arq.Retry`, and the reference
+  now says both.
 
 ## 0.3.0
 

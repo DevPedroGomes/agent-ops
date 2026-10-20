@@ -4,7 +4,7 @@ Por que existe separado do rate limit: o rate limit limita o que UM chamador
 faz por minuto. Nenhum rate limit limita o que TODOS fazem juntos, nem alguem
 criando contas novas — e com cadastro aberto "exigir login" nao e teto de gasto.
 
-Decisoes, todas herdadas do `budget.py` do BrainHub:
+Decisoes, todas herdadas da implementacao original do teto:
 
 - A cota e consumida ANTES da chamada ao provider, nunca depois. Contar depois
   deixa uma rajada concorrente passar toda junta, porque nenhuma delas foi
@@ -165,10 +165,10 @@ async def fechar() -> None:
 # `redis.call` no INCRBY e `redis.pcall` no EXPIRE, e a diferenca e deliberada.
 # Script de Redis NAO desfaz o que ja escreveu quando aborta, igual a MULTI/
 # EXEC: um erro no EXPIRE com `call` derrubaria o script DEPOIS de o INCRBY ter
-# valido, e seria o bug herdado do `budget.py` de volta, agora escondido dentro
-# do Lua. Com `pcall` o EXPIRE erra sem abortar nada, que e o tratamento certo
-# para uma faxina. Um erro no INCRBY, esse sim, aborta antes de qualquer
-# escrita: nao ha o que desfazer e o chamador recusa.
+# valido, e seria o bug herdado da implementacao original de volta, agora
+# escondido dentro do Lua. Com `pcall` o EXPIRE erra sem abortar nada, que e o
+# tratamento certo para uma faxina. Um erro no INCRBY, esse sim, aborta antes
+# de qualquer escrita: nao ha o que desfazer e o chamador recusa.
 #
 # Devolve {recusado, usado, ttl_aplicado}.
 _LUA_CONSUMIR = """
@@ -203,8 +203,8 @@ async def _incrementar_com_ttl(
     `raise_on_error=False` porque o Redis NAO desfaz uma transacao quando um
     comando falha: os outros rodam, e o erro volta na posicao do que falhou.
     Levantar tudo junto colocaria o `EXPIRE` de volta no mesmo escopo de erro
-    do `INCRBY`, que e a forma exata do bug herdado do `budget.py`. Quem chama
-    inspeciona cada slot.
+    do `INCRBY`, que e a forma exata do bug herdado da implementacao original.
+    Quem chama inspeciona cada slot.
     """
     async with r.pipeline(transaction=True) as pipe:
         pipe.incrby(chave, quanto)

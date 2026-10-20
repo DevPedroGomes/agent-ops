@@ -222,8 +222,8 @@ def test_estourar_o_teto_recusa_e_desfaz_o_proprio_incremento(redis_falso):
 
 def test_falha_no_ttl_nao_recusa_a_chamada(monkeypatch):
     # O TTL e faxina, nao corretude. Recusar por causa dele seria ruim; recusar
-    # SEM devolver o incremento — que era o comportamento herdado do budget.py
-    # original — cobra cota de uma chamada que nunca aconteceu.
+    # SEM devolver o incremento — que era o comportamento herdado da
+    # implementacao original — cobra cota de uma chamada que nunca aconteceu.
     #
     # Aqui o EXPIRE falha no MODELO do script, que engole o erro sozinho: este
     # teste continua verde com `redis.call` no lugar do `redis.pcall`. Quem
@@ -717,8 +717,8 @@ class RedisComRollbackQuebrado(FakeRedis):
 
     E a janela entre as duas idas ao Redis: a chamada ja foi contada e a
     compensacao nao acontece. Nao e hipotese remota, e o mesmo tipo de falha de
-    rede que o bug herdado do `budget.py` explorava, e vale tambem para o
-    processo morrer entre uma coisa e outra.
+    rede que o bug herdado da implementacao original explorava, e vale tambem
+    para o processo morrer entre uma coisa e outra.
     """
 
     def __init__(self):

@@ -2,8 +2,8 @@
 
 O que se prende aqui:
 - o mesmo `(tenant, digest)` nao entra duas vezes. Reentregar um job nao pode
-  duplicar efeito, e no BrainHub isso significa nao reprocessar (nem recobrar)
-  o mesmo PDF subido duas vezes;
+  duplicar efeito, e numa plataforma de documentos isso significa nao
+  reprocessar (nem recobrar) o mesmo PDF subido duas vezes;
 - o job_id deriva do projeto + tenant + digest. Sem o projeto, dois apps
   dividindo o Redis deduplicariam o trabalho um do outro; sem o tenant, dois
   tenants subindo o MESMO arquivo compartilham um job so — o segundo e
@@ -54,20 +54,20 @@ class FakePool:
 
 @pytest.fixture(autouse=True)
 def projeto(monkeypatch):
-    monkeypatch.setenv("AGENT_OPS_PROJETO", "brainhub")
+    monkeypatch.setenv("AGENT_OPS_PROJETO", "demo")
     monkeypatch.setenv("AGENT_OPS_PROFUNDIDADE_MAXIMA", "500")
     get_config.cache_clear()
 
 
 def test_job_id_deriva_de_projeto_e_digest():
-    assert queue.fila._job_id("abc123") == "brainhub:abc123"
+    assert queue.fila._job_id("abc123") == "demo:abc123"
 
 
 def test_enfileira_e_devolve_o_job_id():
     pool = FakePool()
     job_id = asyncio.run(queue.enfileirar(pool, "processar", "doc-1", digest="abc"))
 
-    assert job_id == "brainhub:abc"
+    assert job_id == "demo:abc"
     assert pool.enfileirados[0][0] == "processar"
     assert pool.enfileirados[0][1] == ("doc-1",)
 
@@ -77,7 +77,7 @@ def test_mesmo_digest_nao_entra_duas_vezes():
     primeiro = asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
     segundo = asyncio.run(queue.enfileirar(pool, "processar", digest="abc"))
 
-    assert primeiro == "brainhub:abc"
+    assert primeiro == "demo:abc"
     assert segundo is None
     assert len(pool.enfileirados) == 1
 
@@ -118,13 +118,13 @@ def test_job_id_isola_tenants_com_o_mesmo_digest():
     # `digest` e hash de CONTEUDO: dois tenants subindo o mesmo arquivo (um
     # formulario padrao, um relatorio anual publico, um modelo de CV) produzem
     # digests identicos. Sem o tenant no id, os dois jobs sao o mesmo job.
-    assert queue.fila._job_id("abc123", tenant="t1") == "brainhub:t1:abc123"
-    assert queue.fila._job_id("abc123", tenant="t2") == "brainhub:t2:abc123"
+    assert queue.fila._job_id("abc123", tenant="t1") == "demo:t1:abc123"
+    assert queue.fila._job_id("abc123", tenant="t2") == "demo:t2:abc123"
 
 
 def test_sem_tenant_o_id_mantem_o_formato_antigo():
     # Compatibilidade: quem ja chama sem tenant continua com o mesmo id.
-    assert queue.fila._job_id("abc123") == "brainhub:abc123"
+    assert queue.fila._job_id("abc123") == "demo:abc123"
 
 
 def test_tenants_diferentes_com_o_mesmo_digest_ambos_enfileiram():
@@ -132,8 +132,8 @@ def test_tenants_diferentes_com_o_mesmo_digest_ambos_enfileiram():
     a = asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t1"))
     b = asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t2"))
 
-    assert a == "brainhub:t1:abc"
-    assert b == "brainhub:t2:abc"
+    assert a == "demo:t1:abc"
+    assert b == "demo:t2:abc"
     assert len(pool.enfileirados) == 2
 
 
@@ -142,7 +142,7 @@ def test_mesmo_tenant_e_mesmo_digest_deduplica():
     um = asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t1"))
     dois = asyncio.run(queue.enfileirar(pool, "processar", digest="abc", tenant="t1"))
 
-    assert um == "brainhub:t1:abc"
+    assert um == "demo:t1:abc"
     assert dois is None
     assert len(pool.enfileirados) == 1
 
@@ -177,7 +177,7 @@ def test_job_id_de_nomeia_o_job_mesmo_quando_enfileirar_deduplica():
     )
 
     assert duplicado is None
-    assert queue.job_id_de("abc", tenant="t1") == "brainhub:t1:abc"
+    assert queue.job_id_de("abc", tenant="t1") == "demo:t1:abc"
 
 
 class PoolComFilaPropria:
@@ -257,8 +257,8 @@ def test_fila_cheia_de_verdade_nao_e_indisponibilidade():
 
 
 def test_tenant_e_digest_com_dois_pontos_sao_recusados():
-    # projeto="brainhub" + digest="b:c" produziria o mesmo id que
-    # projeto="brainhub" + tenant="b" + digest="c": o job de um tenant viraria
+    # projeto="demo" + digest="b:c" produziria o mesmo id que
+    # projeto="demo" + tenant="b" + digest="c": o job de um tenant viraria
     # o job de outro, que e exatamente o vazamento que o tenant fechou.
     with pytest.raises(ValueError):
         queue.fila._job_id("abc", tenant="acme:prod")

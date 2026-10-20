@@ -1,7 +1,7 @@
 """Configuracao lida do ambiente, com cache.
 
-Prefixo `AGENT_OPS_` para nao colidir com as envs da app hospedeira: o BrainHub
-ja tem `REDIS_URL` propria e as duas podem apontar para instancias diferentes.
+Prefixo `AGENT_OPS_` para nao colidir com as envs da app hospedeira: ela pode
+ter `REDIS_URL` propria, e as duas podem apontar para instancias diferentes.
 
 `extra="ignore"` porque a app hospedeira tem dezenas de envs que nao sao nossas.
 
