@@ -21,7 +21,7 @@ yours. Either ``decode_responses`` setting works.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from pennyguard.stores.base import Counter, ReserveOutcome
 
@@ -169,9 +169,9 @@ class RedisStore:
     def read(self, keys: Sequence[str]) -> list[int]:
         if not keys:
             return []
-        # redis-py types mget as `Awaitable | Any` on the sync client too.
-        values: list[Any] = self._client.mget(list(keys))  # type: ignore[assignment]
-        return _ints(values)
+        # redis-py 5 types mget as `Awaitable | Any` on the sync client, and
+        # later versions as a list. A cast holds under both.
+        return _ints(cast("list[Any]", self._client.mget(list(keys))))
 
     def set_kill(self, kill_key: str, reason: str | None) -> None:
         if reason is None:
