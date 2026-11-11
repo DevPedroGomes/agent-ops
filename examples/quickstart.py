@@ -1,4 +1,6 @@
-"""pennyguard in two minutes, offline. Run: python examples/quickstart.py
+"""pennyguard in two minutes, offline.
+
+From a clone: pip install -e . && python examples/quickstart.py
 
 MemoryStore keeps counters in this process. In production, swap it for
 RedisStore (or AsyncRedisStore with Guard) and every worker shares the limits.

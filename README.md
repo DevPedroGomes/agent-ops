@@ -1,7 +1,7 @@
 # pennyguard
 
 [![CI](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/DevPedroGomes/agent-ops/blob/main/LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
 **Hard dollar budgets for LLM calls, enforced atomically across every worker
@@ -44,7 +44,8 @@ response = await guard.call(
 * Async (`Guard`) and sync (`SyncGuard`) with the same API.
 * `MemoryStore` for tests and single-process apps, no Redis needed.
 
-Try it offline: `python examples/quickstart.py`.
+Try it offline from a clone: `pip install -e .`, then
+`python examples/quickstart.py`.
 
 ## Contents
 
@@ -64,11 +65,13 @@ Try it offline: `python examples/quickstart.py`.
 
 ## Install
 
-Not on PyPI yet. Install from this repository, pinned to a tag:
+Not on PyPI yet. Install from this repository:
 
 ```bash
-pip install "pennyguard[redis] @ git+https://github.com/DevPedroGomes/agent-ops@v0.4.0"
+pip install "pennyguard[redis] @ git+https://github.com/DevPedroGomes/agent-ops@main"
 ```
+
+In production, pin a commit: replace `main` with its SHA.
 
 Python 3.11 or newer.
 
@@ -76,7 +79,7 @@ Python 3.11 or newer.
 
 | What you might use | What it does well | What it does not do here |
 |---|---|---|
-| Spending limits in the provider console | One organization-wide monthly cap | No per-tenant or per-user limits; every customer shares one cap |
+| Spending limits in the provider console | A monthly cap per organization, workspace or project | Not per tenant or user of your app, short of one workspace and API key per customer |
 | An LLM gateway such as LiteLLM's proxy | Budgets per key, user or team | Another service in the request path, to deploy and keep up |
 | Observability platforms (Langfuse, Phoenix and others) | Show what each call cost | Record the cost after the call; nothing stops the next one |
 | A counter in process memory | Simple | Each worker and replica has its own copy of the budget |
@@ -96,8 +99,8 @@ reserve(estimate) ──► Lua script on Redis ──► refused: nothing charg
                          │
      raised ◄────────────┴────────────► returned
         │                                   │
-  HTTP error from the provider:       settle(usage): the charge becomes
-  release, refund the estimate        the real cost
+  provider refused (SDK error         settle(usage): the charge becomes
+  status): release the estimate       the real cost
   anything else: estimate stays
 ```
 
@@ -111,20 +114,24 @@ reserve(estimate) ──► Lua script on Redis ──► refused: nothing charg
    counters move so that the reservation holds exactly the real cost.
 
 If the call raises instead, what happens depends on whether it can have
-been billed. An HTTP error from the provider (any exception carrying a
-`status_code` of 400 or more, as the Anthropic and OpenAI SDK errors do)
-means it refused before generating anything, so the reservation is
-**released**. Anything else keeps the estimate charged: a timeout after the
-request was sent, a stream cut halfway, a client that disconnects
-mid-response, a bug in your code after the reply. In all of those the
-provider may already have billed, and a user who closes the connection just
-before the end must not get the call for free.
+been billed. When the Anthropic or OpenAI SDK raises its error for an HTTP
+status of 400 or more (`APIStatusError` and its subclasses, LiteLLM's
+included), the provider refused before generating anything, so the
+reservation is **released**. Anything else keeps the estimate charged: a
+timeout after the request was sent, a stream cut halfway, a client that
+disconnects mid-response, an exception from your own code after the reply,
+even one with an HTTP status such as FastAPI's `HTTPException`. In all of
+those the provider may already have billed, and a user who closes the
+connection just before the end must not get the call for free. An SDK error
+that follows one of the SDK's own retries keeps the estimate too; see
+[Running it in production](#running-it-in-production).
 
 The limit is enforced at reservation time. A call that costs more than its
-estimate is still recorded in full, so the counters never under-report, and
-the next reservation sees it. `guard.estimate` prices one call at its
-worst case (the full `max_tokens`, every input token at the dearest rate),
-which bounds that overshoot for a single attempt at the rate you pass.
+estimate is still recorded in full, in the window it was reserved in, so the
+counters never under-report and later reservations in that window see it.
+`guard.estimate` prices one call at its worst case (the full `max_tokens`,
+every input token at the dearest rate), which bounds that overshoot for a
+single attempt at the rate you pass.
 
 ## Budgets
 
@@ -156,8 +163,9 @@ the response it returns. If the callable raises, the rule above applies.
 For anything else, hold the reservation yourself. As a context manager it
 applies the same rule to an exception before `settle`, and keeps the
 estimate if the block exits without settling. Both cases log and emit an
-`unsettled` event carrying the exception. Call `release()` yourself when you
-know a failed call was not billed.
+`unsettled` event carrying the exception. With a client other than the
+Anthropic and OpenAI SDKs, call `release()` yourself inside the block when
+you know a failed call was not billed.
 
 **Streaming:**
 
@@ -170,22 +178,34 @@ async with await guard.reserve(estimate, tenant=org_id) as reservation:
     await reservation.settle_response(final)
 ```
 
-**An agent loop under one budget for the whole task:**
+If the stream fails partway, the estimate stays charged: tokens already
+generated are billed.
+
+**An agent loop with a cap per task:** reserve each step on its own, and add
+a budget per task next to the per-tenant one. A runaway loop is stopped at
+the step that would pass the task's cap, and a failed step affects only its
+own reservation.
 
 ```python
-reservation = await guard.reserve(task_estimate, tenant=org_id, tags={"task": "research"})
-usages = []
-try:
-    while not done:
-        response = await client.messages.create(...)
-        usages += Usage.all_from_response(response)
-        ...
-finally:
-    if usages:
-        await reservation.settle(usage=usages)
-    else:
-        await reservation.release()
+budgets = [
+    Budget("tenant", limit_usd=5, window="day", per="tenant"),
+    Budget("task", limit_usd=2, window="day", per="task"),
+]
+...
+while not done:
+    response = await guard.call(
+        lambda: client.messages.create(model=MODEL, max_tokens=4096, messages=msgs),
+        estimate_usd=step_estimate,
+        tenant=org_id,
+        task=task_id,
+    )
+    ...
 ```
+
+One reservation held across many calls is possible, but a failure in the
+middle has no right answer: releasing refunds the calls that succeeded, and
+settling leaves out the one that failed. Per-step reservations avoid the
+question.
 
 **A cost you computed yourself:** `await reservation.settle(cost_usd="0.0123")`.
 
@@ -229,9 +249,16 @@ pricing = Pricing.from_litellm("model_prices_and_context_window.json").with_pric
   `from_litellm` reads them from the `*_above_<N>k_tokens` fields.
 * **Dearer rates** such as Anthropic's fast mode or OpenAI's priority tier are
   read from the response into `Usage.tier` and priced from
-  `variants={"fast": Price(...)}`. A dearer rate with no variant is refused
-  rather than billed at the standard price. `from_litellm` reads OpenAI's
-  priority and flex rates.
+  `variants={"fast": Price(...)}`. A variant can carry its own `above` tiers.
+  A dearer rate with no price, including a long prompt at a variant without
+  a tier for it, is not billed at the standard price: settle keeps the
+  estimate and emits `pricing_failed`. `from_litellm` reads OpenAI's
+  priority and flex rates with their tiers.
+* **Audio tokens** (OpenAI's audio models, Gemini's audio input) are read
+  into `Usage.input_audio_tokens` and `output_audio_tokens` and priced from
+  `input_audio_per_mtok` and `output_audio_per_mtok`, which `from_litellm`
+  reads. Audio with no audio price is treated like a dearer rate with no
+  price. Pass `audio=True` to `guard.estimate` for calls that carry audio.
 * **Estimates** (`guard.estimate(model, input_tokens=..., max_output_tokens=...)`)
   price every input token at the dearest of the input and cache-write
   prices, and assume the full `max_output_tokens`, thinking included. Pass
@@ -267,9 +294,9 @@ Chat Completions and OpenAI Responses objects, or the same shapes as dicts.
 | `UnknownModel` | No price for a model (from `Pricing`; never raised by settle) | |
 
 All four derive from `PennyGuardError`. `fail_open=True` makes an unreadable
-Redis allow the call instead of refusing it; the cost is still recorded at
-settle time if Redis is back by then. The default refuses, because an
-unreadable budget is not an absent budget.
+Redis allow the call instead of refusing it, with an `unchecked` event; the
+cost is still recorded at settle time if Redis is back by then. The default
+refuses, because an unreadable budget is not an absent budget.
 
 ## Kill switch
 
@@ -284,7 +311,7 @@ costs no extra round trip and takes effect on the next reservation of every
 process, without a restart or a deploy. From a shell during an incident:
 
 ```bash
-redis-cli SET 'pg:{docs-qa}:kill' 'cost spike'
+redis-cli SET 'pg:{default}:kill' 'cost spike'   # pg:{<project>}:kill
 ```
 
 ## Status and observability
@@ -312,8 +339,9 @@ guard = Guard(store, budgets, on_event=metrics_hook(scope_keys=["tenant"], tag_k
 ```
 
 This records `pennyguard.cost` (USD, by model), `pennyguard.tokens` (by model
-and token type) and `pennyguard.refusals` (by budget, `killed` or
-`unavailable`). Scope and tag attributes are opt-in because a per-user
+and token type), `pennyguard.refusals` (by budget, `killed` or
+`unavailable`) and `pennyguard.unchecked` (calls let through by
+`fail_open`). Scope and tag attributes are opt-in because a per-user
 attribute on a metric multiplies its time series by the number of users.
 
 ## Running it in production
@@ -328,11 +356,22 @@ attribute on a metric multiplies its time series by the number of users.
   reply is lost, the guard settles it to zero before raising
   `GuardUnavailable`; with `fail_open`, the later settle lands on the real
   cost whether or not the lost reservation went through.
-* **`reservation_ttl`** (six hours by default) is how long an unsettled
-  reservation stays settleable. A settle after that records the real cost
-  on top of the estimate instead of replacing it: an overcount, never an
-  undercount. Raise it for agent tasks that hold one reservation longer.
-  Settled reservations keep their marker for five minutes.
+* **SDK retries.** The Anthropic and OpenAI SDKs retry timeouts, dropped
+  connections, 429 and 5xx on their own, twice by default. An earlier
+  attempt that timed out may have been billed, so a status error that
+  follows a retry keeps the estimate instead of releasing it. Under a burst
+  of 429s that charges estimates for calls that never ran. To avoid that,
+  give the client the guard wraps `max_retries=0` and retry around
+  `guard.call`: every attempt gets its own reservation, released on a 429.
+* **Client disconnects.** An ASGI server cancels the request when the
+  client goes away. A settle or release already in flight finishes in the
+  background, and a reservation cancelled before its reply is refunded.
+* **`reservation_ttl`** (six hours by default, in whole seconds) is how long
+  an unsettled reservation stays settleable. A settle after that records
+  the real cost on top of the estimate instead of replacing it: an
+  overcount, never an undercount. Raise it for work that holds one
+  reservation longer. Settled reservations keep their marker for five
+  minutes.
 * **Redis Cluster** works: every key of a project carries the same hash tag,
   `pg:{project}:...`, which a multi-key script requires.
 * **The server must allow `EVAL`.** A few managed offerings disable scripting;
@@ -351,12 +390,13 @@ attribute on a metric multiplies its time series by the number of users.
   can each overshoot by their own difference. `guard.estimate` with the
   call's `max_tokens` and rate bounds one attempt; a refusal fallback adds a
   second attempt.
-* **A provider error in the middle of a stream releases the reservation.**
-  An exception with an HTTP status means "not billed" to pennyguard, which
-  holds before the first token and not after it. Settle with the usage you
-  have, or call `settle(cost_usd=...)`, if partial streams matter to you.
+* **A failed call keeps its whole estimate**, even a stream that stopped
+  after a few tokens. That overcounts; settle with `cost_usd` yourself if
+  the difference matters to you.
 * **Fixed windows, not rolling ones.** A day budget can be spent at 23:59 and
-  again at 00:01. Pair a day budget with an hour budget if bursts matter.
+  again at 00:01. Pair a day budget with an hour budget if bursts matter. A
+  call settled after its window ended is recorded in the window it was
+  reserved in.
 * **Prices are your responsibility.** pennyguard computes from the table you
   give it. Batch discounts are not modeled (a batch call is charged at the
   standard rate, which overcounts). Fees outside tokens, such as web search
@@ -364,6 +404,8 @@ attribute on a metric multiplies its time series by the number of users.
   if you use them.
 * **Refusals before output are counted** even in the refusal categories
   Anthropic does not bill.
+* **Cached audio is priced as cached text**, because responses do not report
+  it apart.
 * **No rolling history.** Counters hold the current window only. For
   per-call history, send events to your logs or metrics.
 
@@ -380,7 +422,8 @@ The suite runs in under a second without Redis. The Redis tests run the Lua
 scripts themselves: fifty concurrent reservations from separate clients
 against room for ten, a script run twice that must charge once, and
 regressions that fail if `redis.pcall` around `EXPIRE` becomes `redis.call`,
-if the floor at zero goes, or if settling reverts to a delta. CI runs them
+if the marker is written after the charge, if the floor at zero goes, or if
+settling reverts to a delta. CI runs them
 against a real Redis on Python 3.11, 3.12 and 3.13, and fails if any of them
 is skipped.
 
@@ -391,9 +434,10 @@ production document Q&A service: a daily call counter, an append-only
 decision trail and a durable job queue. Version 0.4.0 keeps the idea that
 mattered (a spending cap that refuses rather than guesses) and rebuilds it as
 a dollar-denominated, multi-budget library. The earlier code remains
-installable from the `v0.3.0` tag, and [CHANGELOG.md](CHANGELOG.md) has the
-details.
+installable from the `v0.3.0` tag, and
+[CHANGELOG.md](https://github.com/DevPedroGomes/agent-ops/blob/main/CHANGELOG.md)
+has the details.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/DevPedroGomes/agent-ops/blob/main/LICENSE).

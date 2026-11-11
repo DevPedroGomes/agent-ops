@@ -190,6 +190,18 @@ def test_a_failing_expire_does_not_abort_the_reservation(client: redis.Redis) ->
     assert client.get("pg:{expire}:c") == "2"
 
 
+def test_a_marker_redis_rejects_charges_nothing(client: redis.Redis) -> None:
+    # A script that aborts keeps the writes it already made. With the marker
+    # written after the counters, a TTL Redis rejects (a float, say) would
+    # charge the counters and then fail, and nothing would ever refund them.
+    store = RedisStore(client)
+    counter = Counter("pg:{marker}:c", limit=10, ttl=60)
+    with pytest.raises(redis.ResponseError):
+        store.reserve("pg:{marker}:k", "pg:{marker}:op:1", [counter], 3, 1.5)  # type: ignore[arg-type]
+    assert client.get("pg:{marker}:c") is None
+    assert client.get("pg:{marker}:op:1") is None
+
+
 def test_kill_switch_set_by_hand_reaches_running_guards(client: redis.Redis) -> None:
     guard = SyncGuard(RedisStore(client), [Budget("global", 10)], project="ops")
     client.set("pg:{ops}:kill", "incident 42")

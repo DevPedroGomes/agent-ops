@@ -111,7 +111,14 @@ class TestKeys:
         a = counter_key("p", budget, "20261111", "a:b")
         b = counter_key("p", budget, "20261111", "a%3Ab")
         assert a != b
-        assert a.count(":") == b.count(":") == 4
+        assert a.count(":") == b.count(":") == 5
+
+    def test_the_dimension_is_part_of_the_key(self) -> None:
+        # Two guards in one project with a budget named alike but kept per a
+        # different dimension must not share a counter.
+        by_tenant = counter_key("p", Budget("b", 1, per="tenant"), "x", "acme")
+        by_user = counter_key("p", Budget("b", 1, per="user"), "x", "acme")
+        assert by_tenant != by_user
 
     def test_project_is_a_cluster_hash_tag(self) -> None:
         budget = Budget("b", 1)

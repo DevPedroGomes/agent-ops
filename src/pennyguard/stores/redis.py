@@ -20,6 +20,7 @@ yours. Either ``decode_responses`` setting works.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
@@ -36,10 +37,12 @@ if TYPE_CHECKING:
 # {0, index, current...} when refused and {1, total...} when charged.
 #
 # Reading every counter before writing any is what makes a refusal free: the
-# script returns before its first INCRBY. EXPIRE goes through pcall because a
-# script that aborts keeps the writes it already made, and a failed EXPIRE
-# must not leave a half-charged reservation behind. Amounts stay strings so
-# Lua never formats a large integer in scientific notation.
+# script returns before its first write. A script that aborts keeps the
+# writes it already made, so the marker is written first (if its TTL is
+# rejected, nothing has been charged) and EXPIRE goes through pcall (a failed
+# EXPIRE must not leave a charge behind that the caller sees as an error).
+# Amounts stay strings so Lua never formats a large integer in scientific
+# notation.
 _RESERVE = """
 local held = redis.call('GET', KEYS[2])
 if held then return {3, held} end
@@ -59,13 +62,13 @@ for i = 1, n do
     return out
   end
 end
+redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
 local out = {1}
 for i = 1, n do
   out[i + 1] = redis.call('INCRBY', KEYS[i + 2], ARGV[1])
   local ttl = tonumber(ARGV[2 * i + 2])
   if ttl > 0 then redis.pcall('EXPIRE', KEYS[i + 2], ttl) end
 end
-redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[2])
 return out
 """
 
@@ -74,9 +77,11 @@ return out
 # counter. Moving to a target rather than by a delta is what makes a retried
 # settle, or a settle after a reserve whose reply was lost, land correctly.
 # The floor at zero runs in the same script, so a concurrent charge can never
-# slip between reading a negative value and correcting it.
+# slip between reading a negative value and correcting it. The marker is
+# written before the counters move, as in the reservation script.
 _SETTLE = """
 local delta = tonumber(ARGV[1]) - tonumber(redis.call('GET', KEYS[1]) or '0')
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
 if delta ~= 0 then
   local step = string.format('%d', delta)
   for i = 2, #KEYS do
@@ -88,9 +93,13 @@ if delta ~= 0 then
     if ttl > 0 then redis.pcall('EXPIRE', KEYS[i], ttl) end
   end
 end
-redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
 return 1
 """
+
+
+def _is_async(script: Any) -> bool:
+    # redis.asyncio clients register scripts whose call is a coroutine.
+    return callable(script) and inspect.iscoroutinefunction(script.__call__)
 
 
 def _text(value: Any) -> str:
@@ -147,6 +156,13 @@ class RedisStore:
         self._client = client
         self._reserve = client.register_script(_RESERVE)
         self._settle = client.register_script(_SETTLE)
+        if _is_async(self._reserve):
+            # Every call would return an unawaited coroutine: nothing checked,
+            # nothing charged.
+            raise TypeError(
+                "RedisStore needs a synchronous client such as redis.Redis; "
+                "for a redis.asyncio client, use AsyncRedisStore with Guard"
+            )
 
     def reserve(
         self,
@@ -191,6 +207,11 @@ class AsyncRedisStore:
         self._client = client
         self._reserve = client.register_script(_RESERVE)
         self._settle = client.register_script(_SETTLE)
+        if not _is_async(self._reserve):
+            raise TypeError(
+                "AsyncRedisStore needs a redis.asyncio client; "
+                "for redis.Redis, use RedisStore with SyncGuard"
+            )
 
     async def reserve(
         self,

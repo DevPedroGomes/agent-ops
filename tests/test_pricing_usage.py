@@ -179,17 +179,18 @@ class TestFromLitellm:
         assert threshold == 200_000
         assert tier.input_per_mtok == Decimal(6)
         assert tier.output_per_mtok == Decimal("22.5")
-        # Inherited, but never below the tier's own input price.
-        assert tier.cache_read_per_mtok == Decimal("0.3")
-        assert tier.cache_write_per_mtok == Decimal(6)
+        # Not listed for the tier: the standard price, scaled up by how much
+        # dearer the tier's input is (2x here), as providers price tiers.
+        assert tier.cache_read_per_mtok == Decimal("0.6")
+        assert tier.cache_write_per_mtok == Decimal("7.5")
 
     def test_reads_priority_and_flex_rates(self) -> None:
         price = Pricing.from_litellm(LITELLM).price("gpt-x")
         assert set(price.variants) == {"priority", "flex"}
         assert price.variants["priority"].input_per_mtok == Decimal("4.25")
         assert price.variants["priority"].output_per_mtok == Decimal(17)
-        # Unlisted fields of a variant fall back to the standard rate.
-        assert price.variants["priority"].cache_read_per_mtok == Decimal("1.25")
+        # Unlisted fields of a variant scale with its input price (1.7x).
+        assert price.variants["priority"].cache_read_per_mtok == Decimal("2.125")
         assert price.variants["flex"].output_per_mtok == Decimal(5)
         assert Pricing.from_litellm(LITELLM).price("claude-x").variants == {}
 
@@ -261,15 +262,12 @@ class TestUsage:
                         output_tokens=264,
                         cache_read_input_tokens=10,
                     ),
-                    # A compaction entry may not name a model.
-                    {"type": "compaction", "input_tokens": 50, "output_tokens": 5},
                 ],
             ),
         )
         assert Usage.all_from_response(response) == [
             Usage("claude-x", 535, 0),
             Usage("claude-y", 412, 264, cache_read_tokens=10),
-            Usage("claude-y", 50, 5),
         ]
         # The top level alone is only the attempt that answered.
         assert Usage.from_anthropic(response) == Usage("claude-y", 412, 264)
@@ -444,3 +442,184 @@ class TestReviewRegressions:
         # No one-hour price listed: the provider bills no such writes.
         assert table.price("gpt-x").cache_write_1h_per_mtok == Decimal("2.5")
         assert table.price("gpt-x").worst_case(1_000_000, 0) == Decimal("2.5")
+
+
+def _litellm_entry(**fields: float) -> dict[str, object]:
+    return {"mode": "chat", **fields}
+
+
+class TestAuditRegressions:
+    def test_litellm_one_hour_writes_above_a_tier(self) -> None:
+        entry = _litellm_entry(
+            input_cost_per_token=3e-06,
+            output_cost_per_token=1.5e-05,
+            cache_creation_input_token_cost=3.75e-06,
+            cache_creation_input_token_cost_above_1hr=6e-06,
+            input_cost_per_token_above_200k_tokens=6e-06,
+            output_cost_per_token_above_200k_tokens=2.25e-05,
+            cache_creation_input_token_cost_above_1hr_above_200k_tokens=1.2e-05,
+        )
+        table = Pricing.from_litellm({"c": entry})
+        usage = Usage("c", input_tokens=1_000, cache_write_1h_tokens=250_000)
+        # 1k input at $6 and 250k one-hour writes at $12, not at $6.
+        assert table.cost(usage) == Decimal("3.006")
+        assert table.estimate(
+            "c", input_tokens=250_000, max_output_tokens=0
+        ) == Decimal(3)
+        # Without its own one-hour price, the tier scales the standard one.
+        del entry["cache_creation_input_token_cost_above_1hr_above_200k_tokens"]
+        tier = Pricing.from_litellm({"c": entry}).price("c").above[0][1]
+        assert tier.cache_write_1h_per_mtok == Decimal(12)
+
+    def test_litellm_variants_have_their_own_tiers(self) -> None:
+        entry = _litellm_entry(
+            input_cost_per_token=2.5e-06,
+            output_cost_per_token=1.5e-05,
+            input_cost_per_token_above_272k_tokens=5e-06,
+            output_cost_per_token_above_272k_tokens=2.25e-05,
+            input_cost_per_token_flex=1.25e-06,
+            output_cost_per_token_flex=7.5e-06,
+            input_cost_per_token_above_272k_tokens_flex=2.5e-06,
+            input_cost_per_token_priority=5e-06,
+            output_cost_per_token_priority=3e-05,
+            input_cost_per_token_above_272k_tokens_priority=1e-05,
+        )
+        table = Pricing.from_litellm({"g": entry})
+
+        def cost(tier: str | None) -> Decimal:
+            return table.cost(Usage("g", input_tokens=300_000, tier=tier))
+
+        assert cost(None) == Decimal("1.5")
+        assert cost("priority") == Decimal(3)
+        assert cost("flex") == Decimal("0.75")
+
+    def test_a_long_prompt_at_a_variant_without_tiers(self) -> None:
+        price = Price(
+            2.5,
+            15,
+            above={272_000: Price(5, 22.5)},
+            variants={"priority": Price(5, 30), "flex": Price("1.25", "7.5")},
+        )
+        long = 300_000
+        with pytest.raises(UnknownModel, match="above 272000"):
+            price.cost(Usage("g", input_tokens=long, tier="priority"))
+        # Flex is cheaper: without a tier of its own it pays the standard one.
+        assert price.cost(Usage("g", input_tokens=long, tier="flex")) == Decimal("1.5")
+        assert price.cost(Usage("g", input_tokens=1_000, tier="priority")) == (
+            Decimal("0.005")
+        )
+
+    def test_openai_audio_tokens_are_split_out(self) -> None:
+        response = {
+            "model": "gpt-audio",
+            "usage": {
+                "prompt_tokens": 1_000,
+                "completion_tokens": 600,
+                "prompt_tokens_details": {"cached_tokens": 100, "audio_tokens": 300},
+                "completion_tokens_details": {"audio_tokens": 500},
+            },
+        }
+        usage = Usage.from_response(response)
+        assert usage == Usage(
+            "gpt-audio",
+            input_tokens=600,
+            output_tokens=100,
+            cache_read_tokens=100,
+            input_audio_tokens=300,
+            output_audio_tokens=500,
+        )
+        assert usage.prompt_tokens == 1_000
+        price = Price(
+            "2.5",
+            10,
+            cache_read_per_mtok="1.25",
+            input_audio_per_mtok=40,
+            output_audio_per_mtok=80,
+        )
+        # 600 x 2.5 + 100 x 10 + 100 x 1.25 + 300 x 40 + 500 x 80
+        assert price.cost(usage) == Decimal("0.054625")
+        with pytest.raises(UnknownModel, match="audio"):
+            Price("2.5", 10).cost(usage)
+
+    def test_inconsistent_audio_counts_are_unreadable(self) -> None:
+        response = {
+            "model": "m",
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 6, "audio_tokens": 5},
+            },
+        }
+        with pytest.raises(ValueError):
+            Usage.from_response(response)
+
+    def test_litellm_audio_prices_and_audio_estimates(self) -> None:
+        entry = _litellm_entry(
+            input_cost_per_token=2.5e-06,
+            output_cost_per_token=1e-05,
+            input_cost_per_audio_token=4e-05,
+            output_cost_per_audio_token=8e-05,
+        )
+        table = Pricing.from_litellm({"a": entry})
+        price = table.price("a")
+        assert (price.input_audio_per_mtok, price.output_audio_per_mtok) == (
+            Decimal(40),
+            Decimal(80),
+        )
+        text = table.estimate("a", input_tokens=1_000, max_output_tokens=1_000)
+        audio = table.estimate(
+            "a", input_tokens=1_000, max_output_tokens=1_000, audio=True
+        )
+        assert (text, audio) == (Decimal("0.0125"), Decimal("0.12"))
+        with pytest.raises(UnknownModel, match="audio"):
+            Pricing({"t": Price(1, 2)}).estimate(
+                "t", input_tokens=1, max_output_tokens=1, audio=True
+            )
+
+    def test_an_attempt_without_a_model_after_a_fallback_is_unpriceable(
+        self,
+    ) -> None:
+        response = NS(
+            model="cheap-fallback",
+            usage=NS(
+                input_tokens=5,
+                output_tokens=5,
+                iterations=[
+                    NS(type="message", model=None, input_tokens=100, output_tokens=0),
+                    NS(
+                        type="fallback_message",
+                        model="cheap-fallback",
+                        input_tokens=100,
+                        output_tokens=50,
+                    ),
+                ],
+            ),
+        )
+        # The declined attempt ran on a model the response does not name.
+        # Pricing it at the fallback's rate could undercount.
+        with pytest.raises(ValueError, match="no model"):
+            Usage.all_from_response(response)
+
+    def test_malformed_iterations_are_unreadable(self) -> None:
+        # ValueError, which settle_response turns into "keep the estimate";
+        # anything else would raise after the call was paid for.
+        response = {"model": "m", "usage": {"input_tokens": 1, "iterations": 3}}
+        with pytest.raises(ValueError, match="not a list"):
+            Usage.all_from_response(response)
+
+    def test_an_attempt_without_a_model_on_a_single_model_response(self) -> None:
+        response = {
+            "model": "m",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "iterations": [
+                    {"type": "compaction", "input_tokens": 50, "output_tokens": 5},
+                    {"type": "message", "input_tokens": 10, "output_tokens": 5},
+                ],
+            },
+        }
+        assert Usage.all_from_response(response) == [
+            Usage("m", 50, 5),
+            Usage("m", 10, 5),
+        ]

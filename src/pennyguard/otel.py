@@ -10,6 +10,8 @@ Instruments, all counters:
 * ``pennyguard.tokens``: settled tokens, by ``token.type``.
 * ``pennyguard.refusals``: refused reservations, by ``reason``
   (a budget name, ``killed`` or ``unavailable``).
+* ``pennyguard.unchecked``: reservations allowed without a check because
+  the backend was down and ``fail_open`` is on.
 
 Attributes are low-cardinality by default: ``project`` and ``model``. Scope
 and tag keys are added only when listed in ``scope_keys`` and ``tag_keys``.
@@ -53,6 +55,10 @@ def metrics_hook(
     refusals = meter.create_counter(
         "pennyguard.refusals", description="Reservations refused"
     )
+    unchecked = meter.create_counter(
+        "pennyguard.unchecked",
+        description="Reservations allowed unchecked because the backend was down",
+    )
     scope_keys = tuple(scope_keys)
     tag_keys = tuple(tag_keys)
 
@@ -79,6 +85,8 @@ def metrics_hook(
                     ("cache_read", usage.cache_read_tokens),
                     ("cache_write", usage.cache_write_tokens),
                     ("cache_write_1h", usage.cache_write_1h_tokens),
+                    ("input_audio", usage.input_audio_tokens),
+                    ("output_audio", usage.output_audio_tokens),
                 ):
                     if count:
                         tokens.add(count, {**with_model, "token.type": kind})
@@ -89,5 +97,7 @@ def metrics_hook(
             refusals.add(1, {**attrs, "reason": event.budget or "budget"})
         elif event.kind in ("killed", "unavailable"):
             refusals.add(1, {**attrs, "reason": event.kind})
+        elif event.kind == "unchecked":
+            unchecked.add(1, attrs)
 
     return hook

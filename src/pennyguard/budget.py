@@ -134,7 +134,11 @@ def counter_key(
     project: str, budget: Budget, period: str, scope_value: str | None
 ) -> str:
     base = f"{project_prefix(project)}:{budget.name}:{period}"
-    return base if scope_value is None else f"{base}:{_part(scope_value)}"
+    if scope_value is None:
+        return base
+    # The dimension is part of the key, so two guards with a budget of the
+    # same name over different dimensions never share a counter.
+    return f"{base}:{budget.per}:{_part(scope_value)}"
 
 
 def kill_key(project: str) -> str:

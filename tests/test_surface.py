@@ -7,6 +7,7 @@ import subprocess
 import sys
 from decimal import Decimal
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -106,6 +107,20 @@ def test_otel_metrics(store: MemoryStore, clock: Clock) -> None:
     with pytest.raises(BudgetExceeded):
         guard.reserve(1, tenant="acme")
 
+    class Down(MemoryStore):
+        def reserve(self, *args: object, **kwargs: object) -> NoReturn:
+            raise ConnectionError("redis down")
+
+    # Let through by fail_open: counted apart, never as a refusal.
+    SyncGuard(
+        Down(),
+        [Budget("tenant", 1, per="tenant")],
+        project="otel",
+        clock=clock,
+        fail_open=True,
+        on_event=metrics_hook(meter),
+    ).reserve(1, tenant="acme")
+
     data = reader.get_metrics_data()
     assert data is not None
     points: dict[str, list[tuple[dict[str, str], float]]] = {}
@@ -135,6 +150,7 @@ def test_otel_metrics(store: MemoryStore, clock: Clock) -> None:
     assert points["pennyguard.refusals"] == [
         ({"project": "otel", "scope.tenant": "acme", "reason": "tenant"}, 1)
     ]
+    assert points["pennyguard.unchecked"] == [({"project": "otel"}, 1)]
 
 
 def test_event_amounts(store: MemoryStore, clock: Clock) -> None:

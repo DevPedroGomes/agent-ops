@@ -267,6 +267,9 @@ class TestScopeValidation:
             SyncGuard(store, [Budget("a", 1), Budget("a", 2)])
         with pytest.raises(ValueError):
             SyncGuard(store, [Budget("a", 1)], project="")
+        # A fractional TTL would make Redis reject every reservation.
+        with pytest.raises(TypeError, match="whole seconds"):
+            SyncGuard(store, [Budget("a", 1)], reservation_ttl=28_800.0)  # type: ignore[arg-type]
 
     def test_naive_clock_is_rejected(self, store: MemoryStore) -> None:
         from datetime import datetime
@@ -276,8 +279,33 @@ class TestScopeValidation:
             guard.reserve(1)
 
 
-class ProviderError(Exception):
-    """Shaped like the Anthropic and OpenAI SDKs' status errors."""
+class APIStatusError(Exception):
+    """Stands in for the SDKs' status error, which is matched by class name
+    and package. ``retries`` is what the SDK puts in the retry-count header
+    of the attempt that failed."""
+
+    def __init__(self, status_code: int, retries: int = 0) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+        self.request = NS(headers={"x-stainless-retry-count": str(retries)})
+
+
+APIStatusError.__module__ = "anthropic._exceptions"
+
+
+class ProviderError(APIStatusError):
+    """Like ``anthropic.InternalServerError``: a subclass of the status error."""
+
+
+class OpenAIError(APIStatusError):
+    pass
+
+
+OpenAIError.__module__ = "openai._exceptions"
+
+
+class HTTPException(Exception):
+    """Shaped like FastAPI's: an HTTP status, but raised by your own code."""
 
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")
@@ -285,6 +313,8 @@ class ProviderError(Exception):
 
 
 class HttpxStyleError(Exception):
+    """Like httpx.HTTPStatusError from a webhook call after the reply."""
+
     def __init__(self, status_code: int) -> None:
         super().__init__(f"HTTP {status_code}")
         self.response = NS(status_code=status_code)
@@ -292,9 +322,9 @@ class HttpxStyleError(Exception):
 
 class TestContextManager:
     @pytest.mark.parametrize(
-        "error", [ProviderError(529), ProviderError(400), HttpxStyleError(500)]
+        "error", [ProviderError(529), ProviderError(400), OpenAIError(429)]
     )
-    def test_an_http_error_from_the_provider_releases(
+    def test_an_sdk_error_status_releases(
         self, store: MemoryStore, clock: Clock, events: list[Event], error: Exception
     ) -> None:
         guard = make(store, clock, events)
@@ -302,6 +332,27 @@ class TestContextManager:
             raise error
         assert spent(guard) == {"global": D(0)}
         assert events[-1].kind == "released"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # Your own code, after the paid reply.
+            HTTPException(422),
+            HttpxStyleError(500),
+            # The SDK retried first: the attempt before may have been billed.
+            ProviderError(429, retries=1),
+            # An error event mid-stream comes with the stream's 200 status.
+            ProviderError(200),
+        ],
+    )
+    def test_an_error_status_that_does_not_prove_the_call_was_free(
+        self, store: MemoryStore, clock: Clock, events: list[Event], error: Exception
+    ) -> None:
+        guard = make(store, clock, events)
+        with pytest.raises(type(error)), guard.reserve(3):
+            raise error
+        assert spent(guard) == {"global": D(3)}
+        assert events[-1].kind == "unsettled"
 
     @pytest.mark.parametrize(
         "error", [TimeoutError(), ConnectionResetError(), KeyError("bug")]
@@ -625,6 +676,7 @@ class TestBackendFailure:
         with pytest.raises(GuardUnavailable):
             guard.reserve(1)
         assert kinds(events) == ["unavailable"]
+        assert events[0].error is not None
         for read in (guard.status, guard.killed, guard.resume):
             with pytest.raises(GuardUnavailable):
                 read()
@@ -635,9 +687,18 @@ class TestBackendFailure:
         self, clock: Clock, events: list[Event]
     ) -> None:
         store = BrokenStore(fail_settle=False)
-        guard = SyncGuard(store, [Budget("g", 1)], clock=clock, fail_open=True)
+        guard = SyncGuard(
+            store,
+            [Budget("g", 1)],
+            clock=clock,
+            fail_open=True,
+            on_event=events.append,
+        )
         reservation = guard.reserve(1)
         assert reservation.charged_usd == D(0)
+        # Allowed without a check: not a refusal, and not silent either.
+        assert kinds(events) == ["unchecked"]
+        assert events[0].amount_usd == D(1)
         reservation.settle("0.4")
         store.fail_reserve = False
         with pytest.raises(BudgetExceeded):
@@ -739,13 +800,151 @@ class TestAsyncGuard:
     def test_store_types_are_checked(self, store: MemoryStore) -> None:
         from pennyguard import AsyncRedisStore, RedisStore
 
-        fake = NS(register_script=lambda script: None)
+        class SyncScript:
+            def __call__(self, keys: list[str], args: list[int]) -> list[int]:
+                return [1]
+
+        class AsyncScript:
+            async def __call__(self, keys: list[str], args: list[int]) -> list[int]:
+                return [1]
+
+        sync_client = NS(register_script=lambda script: SyncScript())
+        async_client = NS(register_script=lambda script: AsyncScript())
         with pytest.raises(TypeError, match="SyncGuard"):
-            Guard(RedisStore(fake), [Budget("g", 1)])
+            Guard(RedisStore(sync_client), [Budget("g", 1)])
         with pytest.raises(TypeError, match="Guard with AsyncRedisStore"):
-            SyncGuard(AsyncRedisStore(fake), [Budget("g", 1)])
+            SyncGuard(AsyncRedisStore(async_client), [Budget("g", 1)])
+        # The client itself is checked too: a redis.asyncio client behind
+        # RedisStore would return unawaited coroutines and charge nothing.
+        with pytest.raises(TypeError, match="AsyncRedisStore"):
+            RedisStore(async_client)
+        with pytest.raises(TypeError, match="RedisStore"):
+            AsyncRedisStore(sync_client)
         Guard(store, [Budget("g", 1)])
         SyncGuard(store, [Budget("g", 1)])
+
+    def test_real_redis_clients_are_checked(self) -> None:
+        redis = pytest.importorskip("redis")
+        redis_asyncio = pytest.importorskip("redis.asyncio")
+        from pennyguard import AsyncRedisStore, RedisStore
+
+        with pytest.raises(TypeError):
+            RedisStore(redis_asyncio.Redis())
+        with pytest.raises(TypeError):
+            AsyncRedisStore(redis.Redis())
+
+
+class GatedStore:
+    """An async store whose writes wait for a gate, so a test can cancel the
+    caller while one is in flight. ``reserve`` runs the script before it
+    waits, the way a reply can be lost after the server already charged."""
+
+    def __init__(self) -> None:
+        self.inner = MemoryStore()
+        self.gate: asyncio.Event | None = None
+
+    async def _wait(self) -> None:
+        if self.gate is not None:
+            await self.gate.wait()
+
+    async def reserve(
+        self,
+        kill_key: str,
+        op_key: str,
+        counters: Sequence[Counter],
+        amount: int,
+        hold_ttl: int,
+    ) -> ReserveOutcome:
+        outcome = self.inner.reserve(kill_key, op_key, counters, amount, hold_ttl)
+        await self._wait()
+        return outcome
+
+    async def settle(
+        self, op_key: str, counters: Sequence[Counter], target: int, keep_ttl: int
+    ) -> None:
+        await self._wait()
+        self.inner.settle(op_key, counters, target, keep_ttl)
+
+    async def read(self, keys: Sequence[str]) -> list[int]:
+        return self.inner.read(keys)
+
+    async def set_kill(self, kill_key: str, reason: str | None) -> None:
+        self.inner.set_kill(kill_key, reason)
+
+    async def get_kill(self, kill_key: str) -> str | None:
+        return self.inner.get_kill(kill_key)
+
+
+async def _drain() -> None:
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+
+class TestCancellation:
+    """An ASGI server cancels the request task when the client disconnects."""
+
+    def test_a_settle_cancelled_in_flight_still_lands(
+        self, clock: Clock, events: list[Event]
+    ) -> None:
+        store = GatedStore()
+        guard = Guard(store, [Budget("g", 10)], clock=clock, on_event=events.append)
+
+        async def scenario() -> list[int]:
+            held = await guard.reserve(1)
+            store.gate = asyncio.Event()
+            task = asyncio.create_task(held.settle(4))
+            await _drain()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            store.gate.set()
+            await _drain()
+            return store.inner.read([held._counters[0].key])
+
+        # The call cost $4 against a $1 estimate: all of it is recorded.
+        assert asyncio.run(scenario()) == [4_000_000]
+        assert kinds(events) == ["reserved", "settled"]
+
+    def test_a_release_cancelled_in_flight_still_refunds(
+        self, clock: Clock, events: list[Event]
+    ) -> None:
+        store = GatedStore()
+        guard = Guard(store, [Budget("g", 10)], clock=clock)
+
+        async def scenario() -> list[int]:
+            held = await guard.reserve(3)
+            store.gate = asyncio.Event()
+            task = asyncio.create_task(held.release())
+            await _drain()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            store.gate.set()
+            await _drain()
+            return store.inner.read([held._counters[0].key])
+
+        assert asyncio.run(scenario()) == [0]
+
+    def test_a_reserve_cancelled_after_the_script_ran_is_refunded(
+        self, clock: Clock
+    ) -> None:
+        store = GatedStore()
+        guard = Guard(store, [Budget("g", 10)], clock=clock)
+        key = guard._core.plan({}).counters[0].key
+
+        async def scenario() -> list[int]:
+            store.gate = asyncio.Event()
+            task = asyncio.create_task(guard.reserve(3))
+            await _drain()
+            assert store.inner.read([key]) == [3_000_000]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            store.gate.set()
+            await _drain()
+            return store.inner.read([key])
+
+        assert asyncio.run(scenario()) == [0]
 
 
 class TestIdempotence:

@@ -13,7 +13,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
@@ -35,7 +35,9 @@ _CACHE_WRITE_1H_MARKUP = Decimal(2)
 _VERSION_SUFFIX = re.compile(r"(?:[-@](?:\d{8}|\d{4}-\d{2}-\d{2}|\d{4})|-latest)")
 _TIER_FIELD = re.compile(
     r"^(input_cost_per_token|output_cost_per_token|cache_read_input_token_cost"
-    r"|cache_creation_input_token_cost)_above_(\d+)k_tokens$"
+    r"|cache_creation_input_token_cost(?:_above_1hr)?"
+    r"|input_cost_per_audio_token|output_cost_per_audio_token)"
+    r"_above_(\d+)k_tokens$"
 )
 _LITELLM_MODES = frozenset({"chat", "completion", "responses"})
 _LITELLM_VARIANTS = ("priority", "flex")
@@ -68,8 +70,14 @@ class Price:
     ``Usage.tier``, such as ``{"fast": Price(...)}``. A call at a dearer rate
     with no variant here is not priced at the standard rate, which would
     undercharge: it raises ``UnknownModel`` and the guard keeps the estimate.
-    ``"flex"`` is cheaper than standard, so without a variant it is charged
-    at the standard rate.
+    A variant can have tiers of its own, and the same holds for a long
+    prompt at a variant with no tier for it. ``"flex"`` is cheaper than
+    standard, so where it has no price of its own it is charged at the
+    standard one.
+
+    Audio tokens are priced from ``input_audio_per_mtok`` and
+    ``output_audio_per_mtok``. A call that reports audio with no audio price
+    raises ``UnknownModel`` too: audio costs several times what text does.
     """
 
     input_per_mtok: Decimal
@@ -79,6 +87,8 @@ class Price:
     above: tuple[tuple[int, Price], ...] = ()
     variants: Mapping[str, Price] = field(default_factory=dict, hash=False)
     cache_write_1h_per_mtok: Decimal | None = None
+    input_audio_per_mtok: Decimal | None = None
+    output_audio_per_mtok: Decimal | None = None
 
     def __init__(
         self,
@@ -89,6 +99,8 @@ class Price:
         above: Mapping[int, Price] | tuple[tuple[int, Price], ...] = (),
         variants: Mapping[str, Price] | None = None,
         cache_write_1h_per_mtok: Amount | None = None,
+        input_audio_per_mtok: Amount | None = None,
+        output_audio_per_mtok: Amount | None = None,
     ) -> None:
         tiers = tuple(sorted(dict(above).items()))
         for threshold, tier in tiers:
@@ -123,6 +135,16 @@ class Price:
             "cache_write_1h_per_mtok",
             _per_mtok(cache_write_1h_per_mtok, "cache_write_1h_per_mtok"),
         )
+        object.__setattr__(
+            self,
+            "input_audio_per_mtok",
+            _per_mtok(input_audio_per_mtok, "input_audio_per_mtok"),
+        )
+        object.__setattr__(
+            self,
+            "output_audio_per_mtok",
+            _per_mtok(output_audio_per_mtok, "output_audio_per_mtok"),
+        )
         object.__setattr__(self, "above", tiers)
 
     def _tier(self, prompt_tokens: int) -> Price:
@@ -147,19 +169,43 @@ class Price:
             return self.cache_write_1h_per_mtok
         return self.input_per_mtok * _CACHE_WRITE_1H_MARKUP
 
-    def _rate(self, tier: str | None, model: str) -> Price:
+    def _threshold(self, prompt_tokens: int) -> int:
+        return max((t for t, _ in self.above if prompt_tokens > t), default=0)
+
+    def _for(self, tier: str | None, prompt_tokens: int, model: str) -> Price:
+        """The rates for a call at ``tier`` with a prompt of this size."""
+        standard = self._tier(prompt_tokens)
         if tier is None:
-            return self
+            return standard
+        cheaper = tier in _CHEAPER_THAN_STANDARD
         variant = self.variants.get(tier)
-        if variant is not None:
-            return variant
-        if tier in _CHEAPER_THAN_STANDARD:
-            return self
-        raise UnknownModel(f"{model} at the {tier!r} rate")
+        if variant is None:
+            if cheaper:
+                return standard
+            raise UnknownModel(f"{model} at the {tier!r} rate")
+        threshold = self._threshold(prompt_tokens)
+        if variant._threshold(prompt_tokens) < threshold:
+            # A long prompt at a rate with no long-context price of its own.
+            if cheaper:
+                return standard
+            raise UnknownModel(
+                f"{model} at the {tier!r} rate above {threshold} prompt tokens"
+            )
+        return variant._tier(prompt_tokens)
+
+    def _input_audio(self, model: str) -> Decimal:
+        if self.input_audio_per_mtok is None:
+            raise UnknownModel(f"{model} audio input")
+        return self.input_audio_per_mtok
+
+    def _output_audio(self, model: str) -> Decimal:
+        if self.output_audio_per_mtok is None:
+            raise UnknownModel(f"{model} audio output")
+        return self.output_audio_per_mtok
 
     def cost(self, usage: Usage) -> Decimal:
         """Dollars billed for ``usage`` at this price."""
-        p = self._rate(usage.tier, usage.model)._tier(usage.prompt_tokens)
+        p = self._for(usage.tier, usage.prompt_tokens, usage.model)
         total = (
             usage.input_tokens * p.input_per_mtok
             + usage.output_tokens * p.output_per_mtok
@@ -167,23 +213,51 @@ class Price:
             + usage.cache_write_tokens * p._cache_write()
             + usage.cache_write_1h_tokens * p._cache_write_1h()
         )
+        if usage.input_audio_tokens:
+            total += usage.input_audio_tokens * p._input_audio(usage.model)
+        if usage.output_audio_tokens:
+            total += usage.output_audio_tokens * p._output_audio(usage.model)
         return total / _MILLION
 
     def worst_case(
-        self, input_tokens: int, max_output_tokens: int, tier: str | None = None
+        self,
+        input_tokens: int,
+        max_output_tokens: int,
+        tier: str | None = None,
+        *,
+        audio: bool = False,
     ) -> Decimal:
         """An upper bound for one call that has not happened yet.
 
         Every input token is priced at the dearest way it can be billed
         (plain input, a cache write, a one-hour cache write), and output at
         ``max_output_tokens``, which caps thinking and text together.
-        ``tier`` selects a variant such as ``"fast"``.
+        ``tier`` selects a variant such as ``"fast"``. With ``audio``, input
+        and output are priced at the audio rate where it is dearer.
         """
+        return self._worst_case(
+            input_tokens, max_output_tokens, tier, audio=audio, model="this model"
+        )
+
+    def _worst_case(
+        self,
+        input_tokens: int,
+        max_output_tokens: int,
+        tier: str | None,
+        *,
+        audio: bool,
+        model: str,
+    ) -> Decimal:
         if input_tokens < 0 or max_output_tokens < 0:
             raise ValueError("token counts must not be negative")
-        p = self._rate(tier, "this model")._tier(input_tokens)
+        p = self._for(tier, input_tokens, model)
         per_input = max(p.input_per_mtok, p._cache_write(), p._cache_write_1h())
-        total = input_tokens * per_input + max_output_tokens * p.output_per_mtok
+        per_output = p.output_per_mtok
+        if audio:
+            per_input = max(per_input, p._input_audio(model))
+            if p.output_audio_per_mtok is not None:
+                per_output = max(per_output, p.output_audio_per_mtok)
+        total = input_tokens * per_input + max_output_tokens * per_output
         return total / _MILLION
 
 
@@ -244,13 +318,15 @@ class Pricing:
         input_tokens: int,
         max_output_tokens: int,
         tier: str | None = None,
+        audio: bool = False,
     ) -> Decimal:
-        """Worst-case cost of one call, to pass as ``estimate_usd``."""
-        price = self.price(model)
-        try:
-            return price.worst_case(input_tokens, max_output_tokens, tier)
-        except UnknownModel:
-            raise UnknownModel(f"{model} at the {tier!r} rate") from None
+        """Worst-case cost of one call, to pass as ``estimate_usd``.
+
+        Pass ``audio=True`` when the call sends or returns audio.
+        """
+        return self.price(model)._worst_case(
+            input_tokens, max_output_tokens, tier, audio=audio, model=model
+        )
 
     @classmethod
     def from_litellm(
@@ -264,9 +340,13 @@ class Pricing:
         ``source`` is the parsed JSON or a path to the file. Only chat and
         completion models with token prices are kept. Read: long-context
         tiers (``*_above_200k_tokens`` and similar), one-hour cache writes
-        (``*_above_1hr``), and the ``priority`` and ``flex`` rates as
-        variants. Batch rates are not read: a batch call is billed at the
-        standard rate here, which overcounts.
+        (``*_above_1hr``), audio token prices, and the ``priority`` and
+        ``flex`` rates as variants, each with its own tiers. A price an entry
+        leaves out for a tier or variant is the standard one, scaled up by
+        how much dearer that tier's input is. Batch rates are not read: a
+        batch call is billed at the standard rate here, which overcounts.
+        Cached audio is priced as cached text, because responses do not
+        report it apart.
         """
         if isinstance(source, Mapping):
             data: Mapping[str, Any] = source
@@ -295,61 +375,7 @@ def _mtok(per_token: Any) -> Decimal | None:
 
 
 def _price_from_litellm(entry: Mapping[str, Any]) -> Price:
-    tiers: dict[int, dict[str, Any]] = {}
-    for name, value in entry.items():
-        match = _TIER_FIELD.match(name)
-        if match:
-            tiers.setdefault(int(match.group(2)) * 1_000, {})[match.group(1)] = value
-
-    def build(fields: Mapping[str, Any], base: Price | None) -> Price:
-        def pick(key: str, inherited: Decimal | None) -> Decimal | None:
-            value = _mtok(fields.get(key))
-            return value if value is not None else inherited
-
-        input_price = pick(
-            "input_cost_per_token", base.input_per_mtok if base else None
-        )
-        output_price = pick(
-            "output_cost_per_token", base.output_per_mtok if base else None
-        )
-        if input_price is None or output_price is None:
-            raise ValueError("entry has no input or output price")
-
-        def inherit(key: str, inherited: Decimal | None) -> Decimal | None:
-            # A tier or variant without its own cache-write price must not
-            # fall below its own input price.
-            value = _mtok(fields.get(key))
-            if value is None and inherited is not None:
-                value = max(inherited, input_price)
-            return value
-
-        cache_write = inherit(
-            "cache_creation_input_token_cost",
-            base.cache_write_per_mtok if base else None,
-        )
-        # The table lists a cache-write price for every provider that charges
-        # one. Absent means the provider bills no writes, so the defaults
-        # meant for hand-written prices would only inflate every estimate.
-        if cache_write is None:
-            cache_write = input_price
-        cache_write_1h = inherit(
-            "cache_creation_input_token_cost_above_1hr",
-            base.cache_write_1h_per_mtok if base else None,
-        )
-        return Price(
-            input_per_mtok=input_price,
-            output_per_mtok=output_price,
-            cache_read_per_mtok=pick(
-                "cache_read_input_token_cost",
-                base.cache_read_per_mtok if base else None,
-            ),
-            cache_write_per_mtok=cache_write,
-            cache_write_1h_per_mtok=cache_write
-            if cache_write_1h is None
-            else (cache_write_1h),
-        )
-
-    base = build(entry, None)
+    base = _litellm_rates(entry, None)
     variants: dict[str, Price] = {}
     for name in _LITELLM_VARIANTS:
         suffix = f"_{name}"
@@ -359,15 +385,88 @@ def _price_from_litellm(entry: Mapping[str, Any]) -> Price:
             if key.endswith(suffix)
         }
         if "input_cost_per_token" in fields or "output_cost_per_token" in fields:
-            variants[name] = build(fields, base)
-    if not tiers and not variants:
-        return base
+            variants[name] = _litellm_rates(fields, base)
+    return replace(base, variants=variants) if variants else base
+
+
+def _litellm_rates(fields: Mapping[str, Any], base: Price | None) -> Price:
+    """The flat rates in ``fields`` plus their long-context tiers."""
+    flat = _litellm_flat(fields, base)
+    tiers: dict[int, dict[str, Any]] = {}
+    for name, value in fields.items():
+        match = _TIER_FIELD.match(name)
+        if match:
+            tiers.setdefault(int(match.group(2)) * 1_000, {})[match.group(1)] = value
+    if not tiers:
+        return flat
+    return replace(
+        flat,
+        above=tuple((t, _litellm_flat(f, flat)) for t, f in tiers.items()),
+    )
+
+
+def _litellm_flat(fields: Mapping[str, Any], base: Price | None) -> Price:
+    """One set of rates. A rate ``fields`` leaves out comes from ``base``,
+    scaled by how much dearer this input is than ``base``'s (never down)."""
+
+    def own(key: str) -> Decimal | None:
+        return _mtok(fields.get(key))
+
+    input_price = own("input_cost_per_token")
+    if input_price is None and base is not None:
+        input_price = base.input_per_mtok
+    if input_price is None:
+        raise ValueError("entry has no input price")
+    scale = Decimal(1)
+    if base is not None and base.input_per_mtok > 0:
+        scale = max(scale, input_price / base.input_per_mtok)
+
+    def inherited(
+        key: str, from_base: Decimal | None, floor: Decimal | None = None
+    ) -> Decimal | None:
+        value = own(key)
+        if value is None and from_base is not None:
+            value = from_base * scale
+            if floor is not None:
+                value = max(value, floor)
+        return value
+
+    output_price = inherited(
+        "output_cost_per_token", base.output_per_mtok if base else None
+    )
+    if output_price is None:
+        raise ValueError("entry has no output price")
+    # A cache write inherited by a tier or variant never falls below its own
+    # input price.
+    cache_write = inherited(
+        "cache_creation_input_token_cost",
+        base.cache_write_per_mtok if base else None,
+        floor=input_price,
+    )
+    # The table lists a cache-write price for every provider that charges
+    # one. Absent means the provider bills no writes, so the defaults meant
+    # for hand-written prices would only inflate every estimate.
+    if cache_write is None:
+        cache_write = input_price
+    cache_write_1h = inherited(
+        "cache_creation_input_token_cost_above_1hr",
+        base.cache_write_1h_per_mtok if base else None,
+        floor=input_price,
+    )
     return Price(
-        base.input_per_mtok,
-        base.output_per_mtok,
-        base.cache_read_per_mtok,
-        base.cache_write_per_mtok,
-        above={threshold: build(fields, base) for threshold, fields in tiers.items()},
-        variants=variants,
-        cache_write_1h_per_mtok=base.cache_write_1h_per_mtok,
+        input_per_mtok=input_price,
+        output_per_mtok=output_price,
+        cache_read_per_mtok=inherited(
+            "cache_read_input_token_cost", base.cache_read_per_mtok if base else None
+        ),
+        cache_write_per_mtok=cache_write,
+        cache_write_1h_per_mtok=cache_write
+        if cache_write_1h is None
+        else cache_write_1h,
+        input_audio_per_mtok=inherited(
+            "input_cost_per_audio_token", base.input_audio_per_mtok if base else None
+        ),
+        output_audio_per_mtok=inherited(
+            "output_cost_per_audio_token", base.output_audio_per_mtok if base else None
+        ),
     )

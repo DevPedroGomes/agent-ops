@@ -1,6 +1,7 @@
 """A FastAPI endpoint with per-tenant dollar limits on Claude calls.
 
-    pip install "pennyguard[redis]" anthropic fastapi uvicorn
+    pip install "pennyguard[redis] @ git+https://github.com/DevPedroGomes/agent-ops@main"
+    pip install anthropic fastapi uvicorn
     uvicorn examples.fastapi_anthropic:app --workers 4
 
 Every worker shares the limits through Redis. Requests carry the tenant in an
@@ -58,6 +59,9 @@ guard = Guard(
     project="docs-qa",
     pricing=pricing,
 )
+# The SDK retries 429, 5xx and timeouts by itself. A status error after one
+# of those retries keeps its estimate, since the attempt before it may have
+# been billed; see "SDK retries" in the README for the trade-off.
 client = anthropic.AsyncAnthropic()
 
 
@@ -102,7 +106,15 @@ async def ask(question: Question, x_tenant_id: str = Header()) -> dict[str, str]
         )
     except BudgetExceeded as exc:
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
-        raise HTTPException(429, "Daily usage limit reached", headers=headers) from exc
+        if exc.scope is None:
+            # The service-wide budget, not this tenant's.
+            raise HTTPException(
+                503, "Temporarily unavailable", headers=headers
+            ) from exc
+        limit = "Daily" if exc.budget == "tenant-daily" else "Monthly"
+        raise HTTPException(
+            429, f"{limit} usage limit reached", headers=headers
+        ) from exc
     except (GuardKilled, GuardUnavailable) as exc:
         raise HTTPException(503, "Temporarily unavailable") from exc
 
@@ -122,4 +134,6 @@ async def usage(x_tenant_id: str = Header()) -> list[dict[str, str]]:
             "resets_at": s.resets_at.isoformat() if s.resets_at else "never",
         }
         for s in await guard.status(tenant=x_tenant_id)
+        # The global budget is service-wide spend, not this tenant's.
+        if s.scope is not None
     ]

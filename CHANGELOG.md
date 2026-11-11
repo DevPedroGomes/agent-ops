@@ -1,7 +1,7 @@
 # Changelog
 
-Tag-pinned installs are the only supported way to consume this package, so
-every entry here is something that changes what a pinned upgrade does to you.
+The package is installed from git, pinned to a tag or a commit, so every
+entry here is something that changes what moving that pin does to you.
 
 ## 0.4.0 (unreleased): pennyguard
 
@@ -22,9 +22,9 @@ maintenance-only mode.
 
 ### Added
 
-* `Guard` (async) and `SyncGuard`: reserve an estimate before a call, settle
-  the real cost after it, release if the call fails. `call()` does all three
-  around one provider call.
+* `Guard` (async) and `SyncGuard`: reserve an estimate before a call and
+  settle the real cost after it. `call()` does both around one provider
+  call, and releases the reservation when the provider refused the call.
 * `Budget`: a dollar limit over an `hour`, `day`, `month` or `total` UTC
   window, global or `per` a dimension such as tenant or user. A reservation is
   checked against every applicable budget and charged to all of them, or to
@@ -33,31 +33,44 @@ maintenance-only mode.
   compatible through a per-project hash tag. `MemoryStore` for tests and
   single-process apps.
 * `Pricing` and `Price`: prices per million tokens, cache read and write
-  prices, long-context tiers and rate variants (fast mode, priority, flex).
-  `Pricing.from_litellm` loads LiteLLM's community price table. Versioned
-  model names resolve to their base entry; different models never match by
-  prefix.
+  prices, long-context tiers, rate variants (fast mode, priority, flex) with
+  tiers of their own, and audio token prices. `Pricing.from_litellm` loads
+  LiteLLM's community price table, tiers and variants included; a price an
+  entry leaves out for a tier or variant is scaled up from the standard one.
+  Versioned model names resolve to their base entry; different models never
+  match by prefix. A call at a rate, prompt size or modality with no price
+  keeps its estimate instead of being billed as standard text.
 * `Usage` readers for Anthropic Messages, OpenAI Chat Completions and OpenAI
-  Responses, without importing either SDK. `Usage.all_from_response` prices
-  every attempt of an Anthropic response served by a refusal fallback, under
-  each attempt's own model.
+  Responses, without importing either SDK, with audio tokens split out.
+  `Usage.all_from_response` prices every attempt of an Anthropic response
+  served by a refusal fallback, under each attempt's own model, and refuses
+  to guess the model of an attempt that names none when more than one ran.
 * A kill switch stored in Redis and checked inside the reservation script:
   `guard.kill(reason)` stops every process at once, with no restart.
 * `guard.status()` for health endpoints, an `on_event` hook for every
   reservation, refusal and settlement, and `pennyguard.otel.metrics_hook` for
   OpenTelemetry metrics.
 * `fail_open=True` for applications that prefer availability to the cap when
-  Redis is down. The default still refuses.
+  Redis is down, reported as an `unchecked` event and the
+  `pennyguard.unchecked` metric rather than as a refusal. The default still
+  refuses.
 * Idempotent reservations. Each one has a marker key recording what it has
   charged: running the reservation script twice charges once, and settling
   moves the charge to a target instead of by a delta. A retried command, a
   reply lost after the script ran, and `fail_open` all converge on the real
-  cost. `reservation_ttl` (six hours) bounds how long a reservation stays
-  settleable.
-* A failed call releases its reservation only when the provider answered
-  with an HTTP error. Timeouts, dropped streams, client disconnects and
-  errors in your own code keep the estimate, since the provider may already
-  have billed.
+  cost. `reservation_ttl` (six hours, an int of seconds) bounds how long a
+  reservation stays settleable. The scripts write the marker before moving
+  any counter, so a rejected write charges nothing.
+* A failed call releases its reservation only when the Anthropic or OpenAI
+  SDK raises its HTTP error status on its first attempt. Timeouts, dropped
+  streams, client disconnects, calls the SDK retried and errors raised by
+  your own code, even ones that carry an HTTP status, keep the estimate,
+  since the provider may already have billed.
+* Cancellation-safe writes in `Guard`: a settle or release cancelled in
+  flight (a client disconnecting from an ASGI app) finishes in the
+  background, and a reservation cancelled before its reply is refunded.
+* Counter keys include the budget's dimension, and `RedisStore` and
+  `AsyncRedisStore` refuse a client of the wrong kind.
 * One-hour cache writes priced separately (`Usage.cache_write_1h_tokens`,
   `Price.cache_write_1h_per_mtok`), read from Anthropic's `cache_creation`
   breakdown and LiteLLM's `*_above_1hr` field.

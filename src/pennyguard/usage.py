@@ -20,6 +20,8 @@ from typing import Any
 
 
 def _get(obj: Any, name: str) -> Any:
+    if obj is None:
+        return None
     if isinstance(obj, Mapping):
         return obj.get(name)
     return getattr(obj, name, None)
@@ -45,6 +47,11 @@ def _anthropic_tier(usage: Any) -> str | None:
     return "fast" if _get(usage, "speed") == "fast" else None
 
 
+def _entry_model(entry: Any) -> str | None:
+    model = _get(entry, "model")
+    return model if isinstance(model, str) and model else None
+
+
 def _model(response: Any) -> str:
     model = _get(response, "model")
     if not isinstance(model, str) or not model:
@@ -56,9 +63,9 @@ def _model(response: Any) -> str:
 class Usage:
     """Tokens billed for one call.
 
-    ``input_tokens`` counts only uncached input, billed at the full input
-    price. Cache reads and cache writes are separate because they are priced
-    separately.
+    ``input_tokens`` counts only uncached text input, billed at the full
+    input price. Cache reads, cache writes and audio are separate because
+    they are priced separately.
 
     ``tier`` names a non-standard rate the call ran at: ``"fast"`` for
     Anthropic's fast mode, ``"priority"`` or ``"flex"`` for OpenAI's service
@@ -74,6 +81,10 @@ class Usage:
     tier: str | None = None
     cache_write_1h_tokens: int = 0
     """Cache writes with a one-hour TTL, billed at a higher rate."""
+    input_audio_tokens: int = 0
+    """Audio input, billed at the model's audio rate."""
+    output_audio_tokens: int = 0
+    """Audio output, billed at the model's audio rate."""
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -86,6 +97,8 @@ class Usage:
             "cache_read_tokens",
             "cache_write_tokens",
             "cache_write_1h_tokens",
+            "input_audio_tokens",
+            "output_audio_tokens",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -99,6 +112,7 @@ class Usage:
             + self.cache_read_tokens
             + self.cache_write_tokens
             + self.cache_write_1h_tokens
+            + self.input_audio_tokens
         )
 
     @classmethod
@@ -152,25 +166,49 @@ class Usage:
         top level alone undercounts. A declined attempt that produced no
         output is billed only for some refusal categories; it is counted
         here regardless, which errs toward overcounting.
+
+        An attempt that names no model is priced under the response's model
+        when only that model ran (compaction, say). When a fallback ran too,
+        such an attempt could have run on either, so this raises
+        ``ValueError`` and the guard keeps the estimate.
         """
         usage = _get(response, "usage")
         if usage is None:
             raise ValueError("response has no usage")
         iterations = _get(usage, "iterations")
-        if iterations and _get(usage, "prompt_tokens") is None:
-            model = _model(response)
-            tier = _anthropic_tier(usage)
-            return [
-                cls._anthropic_entry(entry, _get(entry, "model") or model, tier)
-                for entry in iterations
-            ]
-        return [cls.from_response(response)]
+        if not iterations or _get(usage, "prompt_tokens") is not None:
+            return [cls.from_response(response)]
+        if not isinstance(iterations, list | tuple):
+            # ValueError like every other malformed field: see _count.
+            raise ValueError(  # noqa: TRY004
+                f"usage.iterations is not a list: {iterations!r}"
+            )
+        model = _model(response)
+        tier = _anthropic_tier(usage)
+        named = {_entry_model(entry) for entry in iterations} - {None}
+        several = bool(named - {model}) or any(
+            _get(entry, "type") == "fallback_message" for entry in iterations
+        )
+        result = []
+        for entry in iterations:
+            ran_on = _entry_model(entry)
+            if ran_on is None:
+                if several:
+                    raise ValueError(
+                        "an attempt in usage.iterations names no model while "
+                        "more than one model ran, so it cannot be priced"
+                    )
+                ran_on = model
+            result.append(cls._anthropic_entry(entry, ran_on, tier))
+        return result
 
     @classmethod
     def from_openai(cls, response: Any) -> Usage:
         """Read an OpenAI Chat Completions or Responses API response.
 
-        Also reads any OpenAI-compatible response, such as LiteLLM's.
+        Also reads any OpenAI-compatible response, such as LiteLLM's. Audio
+        tokens, which the totals include, are split out under
+        ``input_audio_tokens`` and ``output_audio_tokens``.
         """
         usage = _get(response, "usage")
         if usage is None:
@@ -179,20 +217,31 @@ class Usage:
             prompt = _count(usage, "prompt_tokens")
             output = _count(usage, "completion_tokens")
             details = _get(usage, "prompt_tokens_details")
+            output_details = _get(usage, "completion_tokens_details")
         else:
             prompt = _count(usage, "input_tokens")
             output = _count(usage, "output_tokens")
             details = _get(usage, "input_tokens_details")
-        cached = _count(details, "cached_tokens") if details is not None else 0
-        if cached > prompt:
-            raise ValueError(f"cached_tokens {cached} exceeds input tokens {prompt}")
+            output_details = _get(usage, "output_tokens_details")
+        cached = _count(details, "cached_tokens")
+        audio_in = _count(details, "audio_tokens")
+        audio_out = _count(output_details, "audio_tokens")
+        if cached + audio_in > prompt:
+            raise ValueError(
+                f"cached_tokens {cached} and audio_tokens {audio_in} exceed "
+                f"input tokens {prompt}"
+            )
+        if audio_out > output:
+            raise ValueError(f"audio_tokens {audio_out} exceed output tokens {output}")
         service_tier = _get(response, "service_tier")
         return cls(
             model=_model(response),
-            input_tokens=prompt - cached,
-            output_tokens=output,
+            input_tokens=prompt - cached - audio_in,
+            output_tokens=output - audio_out,
             cache_read_tokens=cached,
             tier=service_tier if service_tier in ("priority", "flex") else None,
+            input_audio_tokens=audio_in,
+            output_audio_tokens=audio_out,
         )
 
     @classmethod

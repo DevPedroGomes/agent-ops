@@ -2,20 +2,22 @@
 
 The cap is enforced when a reservation is made. A call whose real cost turns
 out higher than its estimate is still recorded in full, so the counters never
-lie about spend, and the next reservation sees it.
+lie about spend, and later reservations in the same window see it.
 
 When the block or callable around a provider call raises before settling,
-the reservation is released only if the provider answered with an HTTP
-error, the one failure known not to be billed. On anything else (a timeout,
-a dropped connection, a client that disconnects mid-stream) the estimate
+the reservation is released only if the Anthropic or OpenAI SDK reports that
+the provider refused the call with an HTTP error, the one failure known not
+to be billed. On anything else (a timeout, a dropped connection, a client
+that disconnects mid-stream, an exception from your own code) the estimate
 stays charged, because the provider may already have billed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from types import TracebackType
@@ -26,6 +28,7 @@ from pennyguard._core import (
     BudgetStatus,
     Core,
     Event,
+    Priced,
     ReservationState,
     freeze,
     new_reservation_id,
@@ -33,7 +36,7 @@ from pennyguard._core import (
 )
 from pennyguard.budget import Budget
 from pennyguard.errors import GuardKilled, GuardUnavailable
-from pennyguard.money import Amount, from_micros, to_micros
+from pennyguard.money import Amount, to_micros
 from pennyguard.pricing import Pricing
 from pennyguard.stores.base import AsyncStore, Counter, ReserveOutcome, SyncStore
 from pennyguard.stores.memory import MemoryStore
@@ -54,6 +57,41 @@ def _check_reason(reason: str) -> None:
 def _killed_reason(value: str | None) -> str | None:
     # A flag set by hand with an empty value still refuses every call.
     return None if value is None else (value or "killed")
+
+
+# Writes that outlive a cancelled caller. asyncio keeps only weak references
+# to tasks, so these hold them until they finish.
+_BACKGROUND: set[asyncio.Task[None]] = set()
+
+
+def _keep(write: Coroutine[Any, Any, None]) -> asyncio.Task[None]:
+    task = asyncio.create_task(write)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
+
+
+async def _uncancellable(write: Coroutine[Any, Any, None]) -> None:
+    """Await ``write`` without letting a cancellation of the caller stop it.
+
+    An ASGI server cancels the request task when the client disconnects. If
+    that lands while a settle is in flight, the counters would keep the
+    estimate instead of the real cost, which undercounts any call that cost
+    more. The write runs to the end in the background, and the cancellation
+    still reaches the caller.
+    """
+    await asyncio.shield(_keep(write))
+
+
+async def _compensate(
+    store: AsyncStore, op_key: str, counters: Sequence[Counter], reservation_id: str
+) -> None:
+    # Settling to zero refunds a reservation whose script ran, and leaves a
+    # marker that stops one still in flight from charging when it arrives.
+    try:
+        await store.settle(op_key, counters, 0, SETTLED_TTL)
+    except Exception:
+        logger.warning("pennyguard.compensation_failed reservation=%s", reservation_id)
 
 
 # ---------------------------------------------------------------------------
@@ -119,21 +157,17 @@ class Reservation(ReservationState):
             return self._keep_estimate(
                 priced.error or ValueError("unpriced"), priced.usage
             )
-        actual = to_micros(priced.cost)
         self._state = "settled"
+        await _uncancellable(self._settle_to(to_micros(priced.cost), priced))
+        return priced.cost
+
+    async def _settle_to(self, actual: int, priced: Priced) -> None:
         try:
             await self._store.settle(self._op_key, self._counters, actual, SETTLED_TTL)
         except Exception as exc:
             self._store_failed("settle", exc)
-            return priced.cost
-        self._charged = actual
-        self._event(
-            "settled",
-            amount_usd=priced.cost,
-            usage=priced.usage,
-            usage_costs=priced.costs,
-        )
-        return priced.cost
+            return
+        self._settled(actual, priced)
 
     async def settle_response(self, response: Any) -> Decimal:
         """Settle from an Anthropic or OpenAI response object (or dict).
@@ -153,14 +187,16 @@ class Reservation(ReservationState):
         """Give the whole reservation back: the paid call did not happen."""
         self._require_open("release")
         self._state = "released"
+        await _uncancellable(self._release())
+
+    async def _release(self) -> None:
         refunded = self._charged
         try:
             await self._store.settle(self._op_key, self._counters, 0, SETTLED_TTL)
         except Exception as exc:
             self._store_failed("release", exc)
             return
-        self._charged = 0
-        self._event("released", amount_usd=from_micros(refunded))
+        self._released(refunded)
 
     async def __aenter__(self) -> Reservation:
         return self
@@ -242,17 +278,19 @@ class Guard:
         input_tokens: int,
         max_output_tokens: int,
         tier: str | None = None,
+        audio: bool = False,
     ) -> Decimal:
         """Worst-case cost of one call, to pass as ``estimate_usd``.
 
         Pass ``tier="fast"`` (or another variant) when the call runs at that
-        rate.
+        rate, and ``audio=True`` when it sends or returns audio.
         """
         return self._core.estimate(
             model,
             input_tokens=input_tokens,
             max_output_tokens=max_output_tokens,
             tier=tier,
+            audio=audio,
         )
 
     async def reserve(
@@ -294,18 +332,25 @@ class Guard:
             outcome = await self._store.reserve(
                 core.kill_key, op_key, plan.counters, amount, core.reservation_ttl
             )
+        except asyncio.CancelledError:
+            # The caller is gone, so no call follows, but the script may
+            # already have charged.
+            _keep(_compensate(self._store, op_key, plan.counters, rid))
+            raise
         except Exception as exc:
-            core.emit("unavailable", scope=frozen_scope, tags=frozen_tags, error=exc)
             if core.fail_open:
                 logger.warning("pennyguard.fail_open error=%s", exc)
+                core.emit(
+                    "unchecked",
+                    scope=frozen_scope,
+                    tags=frozen_tags,
+                    amount_usd=estimate,
+                    error=exc,
+                )
                 return reservation(0)
-            # The script may have run with only the reply lost. Settling the
-            # reservation to zero refunds it if so, and otherwise leaves a
-            # marker that stops a late execution from charging.
-            try:
-                await self._store.settle(op_key, plan.counters, 0, SETTLED_TTL)
-            except Exception:
-                logger.warning("pennyguard.compensation_failed reservation=%s", rid)
+            core.emit("unavailable", scope=frozen_scope, tags=frozen_tags, error=exc)
+            # The script may have run with only the reply lost.
+            await _uncancellable(_compensate(self._store, op_key, plan.counters, rid))
             raise GuardUnavailable("budget backend unavailable") from exc
         if outcome.status == "killed":
             reason = _killed_reason(outcome.kill_reason) or "killed"
@@ -335,7 +380,8 @@ class Guard:
     ) -> T:
         """Reserve, run ``fn``, settle from its response, return the response.
 
-        If ``fn`` raises an HTTP error from the provider, the reservation is
+        If ``fn`` raises the Anthropic or OpenAI SDK's error for an HTTP
+        error status, on the SDK's first attempt, the reservation is
         released. If it raises anything else, the estimate stays charged.
         The response must carry ``usage`` the way the Anthropic and OpenAI
         SDKs return it; for streams, use ``reserve``.
@@ -418,13 +464,7 @@ class SyncReservation(ReservationState):
         except Exception as exc:
             self._store_failed("settle", exc)
             return priced.cost
-        self._charged = actual
-        self._event(
-            "settled",
-            amount_usd=priced.cost,
-            usage=priced.usage,
-            usage_costs=priced.costs,
-        )
+        self._settled(actual, priced)
         return priced.cost
 
     def settle_response(self, response: Any) -> Decimal:
@@ -447,8 +487,7 @@ class SyncReservation(ReservationState):
         except Exception as exc:
             self._store_failed("release", exc)
             return
-        self._charged = 0
-        self._event("released", amount_usd=from_micros(refunded))
+        self._released(refunded)
 
     def __enter__(self) -> SyncReservation:
         return self
@@ -524,6 +563,7 @@ class SyncGuard:
         input_tokens: int,
         max_output_tokens: int,
         tier: str | None = None,
+        audio: bool = False,
     ) -> Decimal:
         """See ``Guard.estimate``."""
         return self._core.estimate(
@@ -531,6 +571,7 @@ class SyncGuard:
             input_tokens=input_tokens,
             max_output_tokens=max_output_tokens,
             tier=tier,
+            audio=audio,
         )
 
     def reserve(
@@ -565,10 +606,17 @@ class SyncGuard:
                 core.kill_key, op_key, plan.counters, amount, core.reservation_ttl
             )
         except Exception as exc:
-            core.emit("unavailable", scope=frozen_scope, tags=frozen_tags, error=exc)
             if core.fail_open:
                 logger.warning("pennyguard.fail_open error=%s", exc)
+                core.emit(
+                    "unchecked",
+                    scope=frozen_scope,
+                    tags=frozen_tags,
+                    amount_usd=estimate,
+                    error=exc,
+                )
                 return reservation(0)
+            core.emit("unavailable", scope=frozen_scope, tags=frozen_tags, error=exc)
             try:
                 self._store.settle(op_key, plan.counters, 0, SETTLED_TTL)
             except Exception:

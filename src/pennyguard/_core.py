@@ -33,6 +33,7 @@ EventKind = Literal[
     "refused",
     "killed",
     "unavailable",
+    "unchecked",
     "settled",
     "released",
     "unsettled",
@@ -49,6 +50,11 @@ class Event:
     amount asked for on ``refused``, the real cost for ``settled``, the amount
     given back for ``released``, and the estimate that stays charged for
     ``unsettled`` and ``pricing_failed``.
+
+    ``unavailable`` means the backend could not be reached and the
+    reservation was refused. ``unchecked`` means the same failure with
+    ``fail_open=True``: the call was allowed without a check, and
+    ``amount_usd`` is its estimate.
 
     ``usage`` lists the billed attempts of a settled call, and
     ``usage_costs`` the cost of each, in the same order. A call answered by
@@ -114,20 +120,54 @@ def freeze(mapping: Mapping[str, str] | None, what: str) -> Mapping[str, str]:
     return MappingProxyType(result)
 
 
-def provider_rejected(error: BaseException) -> bool:
-    """Did the provider answer this call with an HTTP error?
+# Matched by class name and package rather than isinstance, so that neither
+# SDK is imported. Subclasses count: LiteLLM's errors derive from OpenAI's.
+_SDK_PACKAGES = frozenset({"anthropic", "openai"})
+_SDK_STATUS_ERROR = "APIStatusError"
 
-    That is the one failure known not to be billed: the provider refused
-    before generating anything. Anything else (a timeout, a dropped
-    connection, a client that disconnects mid-stream, a bug after the reply)
-    may come after the provider started billing. Duck-typed on
-    ``status_code``, which the Anthropic and OpenAI SDKs' status errors carry,
-    or on ``response.status_code`` as httpx's do.
+
+def _sdk_status_error(error: BaseException) -> bool:
+    return any(
+        cls.__name__ == _SDK_STATUS_ERROR
+        and cls.__module__.partition(".")[0] in _SDK_PACKAGES
+        for cls in type(error).__mro__
+    )
+
+
+def _retried(error: BaseException) -> bool:
+    # Both SDKs retry timeouts, dropped connections, 408, 409, 429 and 5xx on
+    # their own (twice by default) and number every attempt in this header.
+    # An attempt that timed out may have been billed, so an error status that
+    # comes after a retry does not prove the call was free.
+    headers = getattr(getattr(error, "request", None), "headers", None)
+    if headers is None:
+        return False
+    try:
+        count = headers.get("x-stainless-retry-count")
+    except Exception:
+        return True
+    return count is not None and str(count).strip() != "0"
+
+
+def provider_rejected(error: BaseException) -> bool:
+    """Did the provider refuse this call before billing anything?
+
+    True only for an HTTP error status (400 or more) raised by the Anthropic
+    or OpenAI SDK, or a subclass such as LiteLLM's, on the SDK's first
+    attempt. Anything else may come after the provider started billing: a
+    timeout, a dropped connection, an error event in the middle of a stream
+    (it arrives with the stream's 200 status), and any exception from your
+    own code after the reply, even one that carries an HTTP status, such as
+    FastAPI's ``HTTPException``. So does an error status that follows one of
+    the SDK's own retries, because the attempt before it may have timed out
+    after the provider billed it.
     """
+    if not _sdk_status_error(error):
+        return False
     status = getattr(error, "status_code", None)
-    if status is None:
-        status = getattr(getattr(error, "response", None), "status_code", None)
-    return isinstance(status, int) and not isinstance(status, bool) and status >= 400
+    if not isinstance(status, int) or isinstance(status, bool) or status < 400:
+        return False
+    return not _retried(error)
 
 
 class Core:
@@ -149,6 +189,13 @@ class Core:
             raise ValueError(f"budget names must be unique, got {names}")
         if not isinstance(project, str) or not project:
             raise ValueError("project must be a non-empty string")
+        if isinstance(reservation_ttl, bool) or not isinstance(reservation_ttl, int):
+            # Redis rejects a fractional TTL, and the reservation would fail
+            # on every call. Seconds from a timedelta need int().
+            raise TypeError(
+                f"reservation_ttl must be whole seconds as an int, "
+                f"got {reservation_ttl!r}"
+            )
         if reservation_ttl < SETTLED_TTL:
             raise ValueError(f"reservation_ttl must be at least {SETTLED_TTL}s")
         self.budgets = tuple(budgets)
@@ -264,6 +311,7 @@ class Core:
         input_tokens: int,
         max_output_tokens: int,
         tier: str | None = None,
+        audio: bool = False,
     ) -> Decimal:
         if self.pricing is None:
             raise ValueError("this guard has no pricing; pass pricing=Pricing(...)")
@@ -272,6 +320,7 @@ class Core:
             input_tokens=input_tokens,
             max_output_tokens=max_output_tokens,
             tier=tier,
+            audio=audio,
         )
 
     def require_pricing(self, action: str) -> None:
@@ -372,6 +421,19 @@ class ReservationState:
         )
         self._event("pricing_failed", amount_usd=kept, usage=usage, error=error)
         return kept
+
+    def _settled(self, actual_micros: int, priced: Priced) -> None:
+        self._charged = actual_micros
+        self._event(
+            "settled",
+            amount_usd=priced.cost,
+            usage=priced.usage,
+            usage_costs=priced.costs,
+        )
+
+    def _released(self, refunded_micros: int) -> None:
+        self._charged = 0
+        self._event("released", amount_usd=from_micros(refunded_micros))
 
     def _store_failed(self, action: str, error: BaseException) -> None:
         logger.error(
