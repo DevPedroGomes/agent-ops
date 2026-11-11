@@ -1,1023 +1,398 @@
-# agent-ops
+# pennyguard
 
 [![CI](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DevPedroGomes/agent-ops/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)
 
-Operational primitives for LLM agents that run in production: a spend cap that
-refuses when it cannot read itself, an append-only decision trail that answers
-"why did it decide that" with a rule code, and a durable job queue that does not
-lose work across a redeploy.
+**Hard dollar budgets for LLM calls, enforced atomically across every worker
+and replica of your app.**
 
-Not an agent framework. It does not compete with LangChain, Agno or the OpenAI
-SDK, and it does not care which one you use. It is the layer underneath, the
-part you write after the first outage.
+An agent stuck in a loop, a public demo that goes viral, or one heavy tenant
+can burn a month of API budget in an afternoon. Rate limits cap requests, not
+dollars. A counter in process memory gives each of your eight workers its own
+full budget. pennyguard reserves the worst-case cost of a call before it runs,
+refuses it if any budget (global, per tenant, per user, per hour, per month)
+lacks room, and records the real cost from the provider's usage afterwards.
+The check and the charge are one Lua script in the Redis you already run.
 
-Extracted from a document Q&A platform serving live traffic, then generalized.
-The extraction found a bug that was in production at the time; see
-[Design decisions](#design-decisions).
+```python
+from pennyguard import AsyncRedisStore, Budget, Guard, Price, Pricing
 
-* Python 3.12 or newer
-* 1900 lines of source and 194 tests. 176 of them run without Redis, a
-  database or the network. The other 18 run against real services, 8 against
-  PostgreSQL and 10 against Redis, and are skipped unless
-  `AGENT_OPS_TEST_POSTGRES_URL` and `AGENT_OPS_TEST_REDIS_URL` are set
-* Redis for metering and the queue, PostgreSQL for the trail and job progress
-* Installed from GitHub by tag. It is not published on PyPI
-* MIT licensed
-* [How it was built](docs/how-it-was-built.md), including the defects found
-  along the way
+guard = Guard(
+    AsyncRedisStore(redis),                     # your redis.asyncio client
+    [
+        Budget("global", limit_usd=200, window="day"),
+        Budget("tenant", limit_usd=5, window="day", per="tenant"),
+        Budget("tenant-monthly", limit_usd=60, window="month", per="tenant"),
+    ],
+    pricing=Pricing({"claude-opus-5-5": Price(input_per_mtok=4, output_per_mtok=20)}),
+)
+
+response = await guard.call(
+    lambda: client.messages.create(model="claude-opus-5-5", max_tokens=2048, messages=msgs),
+    estimate_usd=guard.estimate("claude-opus-5-5", input_tokens=3_000, max_output_tokens=2048),
+    tenant=org_id,
+)
+# Over budget: BudgetExceeded (429, with retry_after). Kill switch on or Redis
+# down: GuardKilled / GuardUnavailable (503). The call never reaches the model.
+```
+
+* No dependencies in the core. `pennyguard[redis]` for production,
+  `pennyguard[otel]` for metrics.
+* Reads usage from Anthropic and OpenAI responses (and anything
+  OpenAI-compatible) without importing either SDK.
+* Async (`Guard`) and sync (`SyncGuard`) with the same API.
+* `MemoryStore` for tests and single-process apps, no Redis needed.
+
+Try it offline: `python examples/quickstart.py`.
 
 ## Contents
 
 * [Install](#install)
-* [A note on naming](#a-note-on-naming)
-* [Configuration](#configuration)
-* [metering](#metering)
-* [decisions](#decisions)
-* [queue](#queue)
-* [API reference](#api-reference)
-* [Design decisions](#design-decisions)
-* [Operating notes](#operating-notes)
-* [Testing](#testing)
-* [Known limitations](#known-limitations)
-* [Versioning](#versioning)
-* [License](#license)
+* [Why not something else](#why-not-something-else)
+* [How it works](#how-it-works)
+* [Budgets](#budgets)
+* [Reserving and settling](#reserving-and-settling)
+* [Pricing](#pricing)
+* [Reading usage from responses](#reading-usage-from-responses)
+* [Errors and HTTP status codes](#errors-and-http-status-codes)
+* [Kill switch](#kill-switch)
+* [Status and observability](#status-and-observability)
+* [Running it in production](#running-it-in-production)
+* [Limitations](#limitations)
+* [Development](#development)
 
 ## Install
 
-The package is not on PyPI. Install it from this repository, pinned to a tag:
+Not on PyPI yet. Install from this repository, pinned to a tag:
 
 ```bash
-pip install "git+https://github.com/DevPedroGomes/agent-ops@v0.3.0"
+pip install "pennyguard[redis] @ git+https://github.com/DevPedroGomes/agent-ops@v0.4.0"
 ```
 
-Pinned by tag on purpose. A dependency that tracks `main` breaks your production
-without a commit in your repository.
+Python 3.11 or newer.
 
-Installing pulls `redis`, `arq`, `sqlalchemy` and `pydantic-settings`. Import
-cost is per subpackage, not per install: `agent_ops.metering` loads Redis only,
-and neither SQLAlchemy nor arq. A test pins that.
+## Why not something else
 
-## A note on naming
-
-The public API is in Portuguese (`consumir`, `enfileirar`, `marcar`). It was
-extracted from a Portuguese-language codebase and the names were preserved
-deliberately, so the origin application could migrate by changing an import line
-rather than every call site. Documentation, comments in this file, and all
-reasoning are in English.
-
-A short glossary, since the names appear throughout:
-
-| Portuguese | English |
-|---|---|
-| `consumir` / `devolver` | consume quota / refund quota |
-| `fechar` | close the client, at shutdown |
-| `aio` | the async twin of a database function |
-| `panorama` | overview, for the health endpoint |
-| `registrar` / `digerir` | record a decision / hash an input |
-| `listar` / `por_execucao` / `filhos` | read the trail: recent / one run / children |
-| `contagem_por_regra` | count decisions per rule |
-| `purgar` | delete rows past a retention cutoff |
-| `enfileirar` / `profundidade` | enqueue / queue depth |
-| `marcar` / `ler` / `descartar` | mark progress / read progress / dead-letter |
-| `listar_por_estado` / `travados` | list by state / find stalled jobs |
-| `tentar_de_novo` / `esgotou` | retry / are retries exhausted |
-| `TetoAtingido` / `TetoIndisponivel` | cap reached / cap unreadable |
-| `FilaCheia` / `FilaIndisponivel` | queue full / queue unreadable |
-
-## Configuration
-
-Every setting reads from the environment with the `AGENT_OPS_` prefix, so it
-cannot collide with the host application's own variables. Unknown variables are
-ignored, because the host has dozens that are none of this package's business.
-
-| Variable | Default | Purpose |
+| What you might use | What it does well | What it does not do here |
 |---|---|---|
-| `AGENT_OPS_REDIS_URL` | `redis://localhost:6379` | Metering and queue backend |
-| `AGENT_OPS_PROJETO` | `default` | Namespaces every Redis key and job id |
-| `AGENT_OPS_PROFUNDIDADE_MAXIMA` | `500` | Queue depth above which enqueueing is refused |
-| `AGENT_OPS_KILL_SWITCH` | `false` | Stops all paid calls, read from the process environment on every call |
+| Spending limits in the provider console | One organization-wide monthly cap | No per-tenant or per-user limits; every customer shares one cap |
+| An LLM gateway such as LiteLLM's proxy | Budgets per key, user or team | Another service in the request path, to deploy and keep up |
+| Observability platforms (Langfuse, Phoenix and others) | Show what each call cost | Record the cost after the call; nothing stops the next one |
+| A counter in process memory | Simple | Each worker and replica has its own copy of the budget |
 
-Three of these are load-bearing in ways that are easy to miss.
+pennyguard is the fourth row done properly: a library in your process, with
+the counters in Redis so that every process shares them, and the check and
+charge done atomically on the server.
 
-`AGENT_OPS_REDIS_URL` is separate from your application's own `REDIS_URL`. They
-may point at different instances. Because metering fails closed, forgetting this
-variable does not degrade the service: it refuses every quota-consuming request,
-while `localhost` keeps working in development. That failure mode has happened,
-which is why the variable is documented this prominently.
+## How it works
 
-`AGENT_OPS_PROJETO` must not contain a colon. It is validated at load time,
-because the colon separates the fields of every Redis key and job id this
-package builds, and a colon inside a field makes two different keys collapse
-into the same one. That collision does not raise; it silently merges the spend
-cap of two projects, or hands one tenant another tenant's job.
+```
+reserve(estimate) ──► Lua script on Redis ──► refused: nothing charged, raise
+                         │ check every budget
+                         │ charge every budget
+                         ▼
+                      provider call
+                         │
+     raised ◄────────────┴────────────► returned
+        │                                   │
+  HTTP error from the provider:       settle(usage): the charge becomes
+  release, refund the estimate        the real cost
+  anything else: estimate stays
+```
 
-`AGENT_OPS_KILL_SWITCH` is read with `os.getenv` on every call rather than
-through the cached settings object. That call sees the environment of the
-running process, and nothing outside the process can change that environment
-after it starts. Engaging the switch on a deployed service therefore means
-setting the variable and restarting the process. For a container that means
-recreating it with the new value, since `docker restart` keeps the old
-environment. No image rebuild and no code change are needed. Code inside the
-process that assigns `os.environ["AGENT_OPS_KILL_SWITCH"]` takes effect on the
-next call, which the cached settings object would not allow.
+1. **Reserve.** One script reads every applicable counter, refuses if any of
+   them would pass its limit, and otherwise charges all of them. A refusal
+   writes nothing. Fifty concurrent reservations against room for ten admit
+   exactly ten, whatever the number of processes (a test runs this against a
+   real Redis).
+2. **Call the model.**
+3. **Settle** with the real cost, computed from the response's usage. The
+   counters move so that the reservation holds exactly the real cost.
 
-Nothing connects at import time. Clients are created on the first call, so
-importing the package in a test, a migration script or a CLI opens no sockets.
+If the call raises instead, what happens depends on whether it can have
+been billed. An HTTP error from the provider (any exception carrying a
+`status_code` of 400 or more, as the Anthropic and OpenAI SDK errors do)
+means it refused before generating anything, so the reservation is
+**released**. Anything else keeps the estimate charged: a timeout after the
+request was sent, a stream cut halfway, a client that disconnects
+mid-response, a bug in your code after the reply. In all of those the
+provider may already have billed, and a user who closes the connection just
+before the end must not get the call for free.
 
----
+The limit is enforced at reservation time. A call that costs more than its
+estimate is still recorded in full, so the counters never under-report, and
+the next reservation sees it. `guard.estimate` prices one call at its
+worst case (the full `max_tokens`, every input token at the dearest rate),
+which bounds that overshoot for a single attempt at the rate you pass.
 
-## metering
-
-### The problem
-
-A public demo spends real money per click. A per-caller rate limit does not
-help: it bounds what one caller does per minute, not what everyone does
-together, and it does nothing about someone creating new accounts. With open
-signup, "require login" is not a spending cap.
-
-### The guarantees
-
-* Quota is consumed before the paid call, never after. Counting afterwards lets
-  a concurrent burst through, because none of them have been counted yet.
-* `INCR` first, check second. Two concurrent requests each see their own
-  post-increment total, so neither escapes the cap. Whoever loses the race
-  undoes its own increment.
-* **A refused call costs no quota, and the server guarantees it.** Reserving,
-  checking and compensating happen in one Lua script, so there is no window in
-  which the counter is inflated and no second round trip that can fail. While
-  compensation was a separate call, a blink of the network left a refused call
-  charged until the day rolled over, and later visitors were turned away for
-  quota nobody spent.
-* An unreadable backend refuses. An unreadable cap is not an absent cap.
-* The day rolls over in UTC, so the reset does not drift with the server's
-  timezone.
-* Counters are namespaced by project, day, quota type and optional scope, so a
-  per-IP cap and a global cap can run side by side without consuming each other.
-
-### Usage
+## Budgets
 
 ```python
-from agent_ops import metering
+Budget("global", limit_usd=200, window="day")                 # one shared counter
+Budget("tenant", limit_usd=5, window="day", per="tenant")     # one counter per tenant
+Budget("user-hourly", limit_usd=0.50, window="hour", per="user")
+Budget("lifetime-trial", limit_usd=10, window="total", per="user")
+```
 
+* `window` is `"hour"`, `"day"`, `"month"` or `"total"`. Windows are fixed and
+  aligned to UTC: a day budget resets at midnight UTC, a month budget on the
+  first of the month. `"total"` never resets.
+* `per` names a dimension. Pass its value as a keyword when reserving
+  (`tenant="acme"`). A reservation is checked against every global budget and
+  every budget whose dimension it names, all or nothing.
+* Leaving out a dimension a budget needs, or passing one no budget uses,
+  raises `ValueError`. A typo such as `tennant="acme"` fails in the first test
+  instead of silently skipping the per-tenant cap.
+* Amounts are exact decimals stored as integer micro-dollars. A small-model
+  call costs a fraction of a cent, so whole cents would round most calls to
+  zero.
+
+## Reserving and settling
+
+`guard.call` covers the common case: reserve, run the callable, settle from
+the response it returns. If the callable raises, the rule above applies.
+
+For anything else, hold the reservation yourself. As a context manager it
+applies the same rule to an exception before `settle`, and keeps the
+estimate if the block exits without settling. Both cases log and emit an
+`unsettled` event carrying the exception. Call `release()` yourself when you
+know a failed call was not billed.
+
+**Streaming:**
+
+```python
+async with await guard.reserve(estimate, tenant=org_id) as reservation:
+    async with client.messages.stream(model=MODEL, max_tokens=4096, messages=msgs) as stream:
+        async for text in stream.text_stream:
+            yield text
+        final = await stream.get_final_message()
+    await reservation.settle_response(final)
+```
+
+**An agent loop under one budget for the whole task:**
+
+```python
+reservation = await guard.reserve(task_estimate, tenant=org_id, tags={"task": "research"})
+usages = []
 try:
-    remaining = await metering.consumir("chat", limite=300)
-except metering.TetoIndisponivel as exc:
-    # Backend unreadable. This is unavailability, not a limit. No Retry-After:
-    # nobody knows when Redis comes back.
-    raise HTTPException(503, exc.mensagem) from exc
-except metering.TetoAtingido as exc:
-    # Daily cap reached. This is a usage limit, and it resets at a known time.
-    raise HTTPException(
-        429, exc.mensagem,
-        headers={"Retry-After": str(metering.segundos_ate_meia_noite_utc())},
-    ) from exc
-
-try:
-    result = await call_provider()
-except Exception:
-    await metering.devolver("chat")   # the paid call never happened
-    raise
-```
-
-`TetoIndisponivel` subclasses `TetoAtingido`, so existing `except TetoAtingido`
-clauses keep working. Order matters: Python matches top to bottom, so the narrow
-handler must come first or every 503 silently becomes a 429.
-
-`devolver` is best-effort and never raises on a backend failure. A lost refund
-costs a little slack; an unrecorded spend costs money. It does raise
-`ValueError` for a non-positive amount, because `devolver(-1)` is an increment
-in disguise, which is charging quota through the refund path.
-
-It also never drives the counter below zero. The key is derived from today's
-date, so a call reserved at 23:59:59 whose refund runs at 00:00:01 lands on
-tomorrow's key. Refunding what was never consumed has to be harmless rather
-than turn into credit for everyone using that quota.
-
-`unidades` is where computed values enter: pages in a PDF, an estimated token
-count. Zero and negative are rejected for the same reason, from the other side.
-A negative increment would push the counter below zero and hand free budget to
-everyone.
-
-Scoped caps use the same call:
-
-```python
-await metering.consumir("chat", limite=20, escopo=f"ip:{client_ip}")
-```
-
-The scope is the last field of the key, so it may contain colons. The quota type
-may not, and is validated.
-
-Pass the same scope to `panorama` to read that counter back. Scoped and global
-counts are separate accounts on purpose, so neither shows up in the other.
-There is no way to enumerate every scope: they are usually per IP, and scanning
-Redis for them would put an unbounded operation in the health check path.
-
-### Shutdown
-
-```python
-await metering.fechar()   # in the app lifespan teardown
-```
-
-The Redis client is created on the first call and held for the process. That is
-correct for a service that stays up, and it gets in the way twice: an
-interpreter exiting under load complains about an unclosed connection, and a
-process that runs more than one event loop finds the client bound to the first
-one. `fechar` closes it and releases the singleton, so the next call opens a
-fresh client. It never raises, and it releases the singleton even when the
-close fails.
-
-### Health endpoint
-
-```python
-await metering.panorama({"chat": 300, "ingest": 100})
-# {"date": "2026-08-24", "escopo": None, "kill_switch": False,
-#  "degraded": False, "used": {...}, "limits": {...}, "remaining": {...}}
-
-await metering.panorama({"chat": 20}, escopo=f"ip:{client_ip}")   # one visitor
-```
-
-Limits are passed in rather than read from configuration, because each project
-names its own quota types and the package should not know them.
-
-`panorama` never raises, and both branches return the same shape. A health check
-that dies when Redis is down turns a partial degradation into a full outage
-page, and a handler reading `p["remaining"]` would raise `KeyError` exactly when
-the backend is unreachable. When `degraded` is true, the counters read zero
-because the real values are unknown, not because quota is exhausted.
-
-The kill switch is read the same way here, on every call, so the health
-endpoint cannot report "running" while `consumir` is already refusing.
-
----
-
-## decisions
-
-### The problem
-
-When an agent writes to a customer's system, somebody will eventually ask why.
-"The model decided" is not an answer that survives an audit. Decisions that live
-only in a response stream are gone when the page reloads.
-
-### The guarantees
-
-* `registrar` never raises. The trail is observability. Losing a row is bad;
-  killing the response a visitor was already receiving because of an `INSERT` is
-  worse. It returns the new row id, or `None` when the write failed.
-* Metadata, never content. `input_digest` is a hash. There is no column for the
-  input text, and a test enforces the exact column set, so any new column under
-  any name fails it. Without that rule the trail becomes a second copy of the
-  corpus, without the isolation protections of the first.
-* `rule_code` is `NOT NULL`. It is the field that answers "why" with a code
-  instead of generated prose.
-* `tenant_id` on every row, and reads are expected to filter by it.
-* The DDL is idempotent and safe to run on every boot.
-* The DDL is portable: the same file runs on PostgreSQL and on SQLite, so there
-  is no second schema to keep in sync.
-
-### Usage
-
-```python
-from agent_ops import decisions
-
-decisions.migracao.aplicar(engine)   # idempotent, safe on every boot
-
-decisions.registrar(
-    engine,
-    tenant_id=user_id,
-    correlation_id=run_id,           # ties every decision of one run together
-    input_digest=decisions.digerir(resume_bytes),
-    rule_code="RUBRIC.PYTHON.SENIOR",
-    evidence={"years_python": 7, "source": "line 12"},
-    outcome={"points": 30},
-    model="claude-haiku-4-5",
-    tokens_in=800, tokens_out=120, cost_cents=2,
-    parent_id=orchestrator_decision_id,   # worker to orchestrator
-)
-```
-
-The split between `evidence` and `outcome` is the point. The model extracts
-evidence, with a pointer to where it came from. A deterministic rule decides.
-Changing the rule re-scores the entire history without spending a token, and the
-same input always produces the same output.
-
-Arguments are keyword-only: twelve fields, and a wrong positional order would
-write `outcome` into `evidence` with no type error to catch it.
-
-`digerir` accepts `str` or `bytes` and normalizes `str` to UTF-8 first, so the
-same content read from an upload and from a form field produces the same digest.
-Without that, the queue's deduplication would let the repeated work through.
-
-### Reading the trail
-
-Four indexes exist for the four reads the trail was designed for, and one
-function covers each:
-
-```python
-from agent_ops import decisions
-
-decisions.listar(engine, tenant_id=user_id, limite=50)
-decisions.por_execucao(engine, tenant_id=user_id, correlation_id=run_id)
-decisions.filhos(engine, tenant_id=user_id, parent_id=orchestrator_id)
-decisions.contagem_por_regra(engine, desde=last_week)
-```
-
-| Function | The question it answers | Index |
-|---|---|---|
-| `listar` | What did this tenant's agent decide recently | `(tenant_id, created_at DESC)` |
-| `por_execucao` | Replay one run in order | `(correlation_id, created_at)` |
-| `filhos` | Which workers did this orchestrator spawn | `(parent_id)` |
-| `contagem_por_regra` | Which rule always falls through to the safety net | `(project, rule_code)` |
-
-`tenant_id` is keyword-only and has no default on every query that returns
-rows. A correlation id is not a permission: it appears in logs, in URLs and in
-error payloads, and a query filtered by it alone hands over another customer's
-entire trail. Making the tenant part of the signature is what turns that rule
-from a convention into something you cannot forget, and a test fails if anyone
-gives it a default.
-
-`contagem_por_regra` is the one query without a tenant, deliberately. It asks
-about the whole project rather than about any customer, which is why it returns
-counts and no rows: no digest, no id, nothing that ties a number to a person.
-
-`evidence` and `outcome` come back as dictionaries rather than as the stored
-JSON text. A row whose JSON does not parse yields `{}` plus the raw value under
-`evidence_bruto`, because a trail that refuses to open because of one bad row
-is worse than one incomplete row.
-
-These reads raise when the database fails, unlike every write in this package.
-The inversion is deliberate. A write swallows its failure because losing one
-row of observability beats killing the response a visitor was already
-receiving. A read cannot do the same: an empty list caused by an outage is
-indistinguishable from "this tenant made no decisions", and that is the most
-dangerous answer an audit can give.
-
-`listar` paginates by timestamp, not by offset. Pass the `created_at` of the
-last row you saw as `antes_de`. The table only grows, and a large offset
-rescans everything before it on every page.
-
----
-
-## queue
-
-### The problem
-
-Work that must not vanish. Under FastAPI's `BackgroundTasks`, a job runs inside
-the web process after the response: a redeploy mid-job loses it silently, and a
-blocking call stalls everything including the health endpoint.
-
-### The guarantees
-
-* Deduplication rides on arq's own uniqueness. `enqueue_job(_job_id=X)` returns
-  `None` when a job with that id is queued or running, so dedup needs no table
-  and no lock. This package adds the project and tenant namespace.
-* Refusal before acceptance. Above the depth cap, or when the depth cannot be
-  read, enqueueing raises rather than accepting work it cannot do. A queue that
-  only grows is indistinguishable from a service that is down, except it lies to
-  the client.
-* Durable progress in PostgreSQL, so it survives the process and outlives arq's
-  result key.
-* Exponential backoff with a ceiling: 5s, 10s, 20s, 40s, capped at 300s. Without
-  growth, five retries against a downed provider all land in the same second,
-  which is one chance, not five.
-* A dead-letter state carrying a human-readable reason.
-
-### Setup
-
-```python
-from agent_ops import queue
-
-queue.aplicar_schema(engine)   # idempotent; call it on both web and worker boot
-```
-
-Forgetting this is silent: `marcar` swallows "no such table" and `ler` returns
-`None`, which is indistinguishable from "the job never started". The only trace
-is a log line, which is why that log line carries the exception type.
-
-### Enqueueing
-
-```python
-from agent_ops import decisions, queue
-
-pool = await queue.criar_pool()       # once per process, in the app lifespan
-
-digest = decisions.digerir(file_bytes)
-job_id = queue.job_id_de(digest, tenant=user_id)
-
-try:
-    await queue.enfileirar(
-        pool, "ingest", doc_id,
-        digest=digest, tenant=user_id,
-    )
-except queue.FilaIndisponivel as exc:
-    raise HTTPException(503, exc.mensagem) from exc
-except queue.FilaCheia as exc:
-    raise HTTPException(429, exc.mensagem,
-                        headers={"Retry-After": str(exc.retry_after)}) from exc
-
-return {"job_id": job_id}
-```
-
-Two things worth reading twice.
-
-`enfileirar` returning `None` means the work was already queued, and that is
-success, not failure. The caller only needs to know the work will happen. That
-is why the response uses `job_id_de`, which is deterministic and available on
-both paths; returning the enqueue result would leave the client unable to watch
-its own upload.
-
-`tenant` is not optional in practice. Without it, two users who submit
-byte-identical content collide onto the same job id: the second is told the work
-is happening, no job runs for them, and they poll a job belonging to someone
-else. Neither `tenant` nor `digest` may contain a colon, for the same reason
-`AGENT_OPS_PROJETO` may not.
-
-Depth is read from the pool's own queue name, not from arq's default, so an
-application that names its queue still gets backpressure.
-
-### The worker
-
-```python
-import asyncio
-from arq.connections import RedisSettings
-from agent_ops import queue
-from agent_ops.config import get_config
-
-async def ingest(ctx, doc_id):
-    job_id = ctx["job_id"]
-    queue.marcar(engine, job_id, estado="rodando", percentual=0,
-                 tentativas=ctx["job_try"])
-    try:
-        await do_the_work(doc_id)
-    except asyncio.CancelledError:
-        # job_timeout and worker shutdown cancel the task. CancelledError
-        # derives from BaseException, so the clause below does not catch it,
-        # and without this clause the row stays at "rodando" forever.
-        # Record it as pending, not as failed: with retry_jobs left at its
-        # default, arq puts a cancelled job back on the queue.
-        queue.marcar(engine, job_id, estado="pendente",
-                     detalhe="interrupted, will run again")
-        raise
-    except Exception as exc:
-        if queue.esgotou(ctx):
-            queue.descartar(engine, job_id, motivo=f"{type(exc).__name__}: {exc}")
-            return
-        queue.marcar(engine, job_id, estado="pendente",
-                     detalhe=f"retrying after {type(exc).__name__}")
-        queue.tentar_de_novo(ctx)          # raises arq.Retry with backoff
+    while not done:
+        response = await client.messages.create(...)
+        usages += Usage.all_from_response(response)
+        ...
+finally:
+    if usages:
+        await reservation.settle(usage=usages)
     else:
-        queue.marcar(engine, job_id, estado="concluido", percentual=100)
-
-class WorkerSettings:
-    functions = [ingest]
-    redis_settings = RedisSettings.from_dsn(get_config().redis_url)
-    max_tries = queue.MAX_TENTATIVAS      # tie these together, see below
-    max_jobs = 4                          # size this to the host, not to hope
-    job_timeout = 1_800
-    health_check_interval = 30
+        await reservation.release()
 ```
 
-Run it: `arq module.WorkerSettings`
+**A cost you computed yourself:** `await reservation.settle(cost_usd="0.0123")`.
 
-`max_tries` and `esgotou` must use the same constant. In arq, when
-`job_try > max_tries` the job is finished without calling the function. A
-mismatch means `descartar` never runs and the row stays `rodando` forever, so
-the job disappears from the operations view with no error anywhere. Declaring
-`max_tries = queue.MAX_TENTATIVAS` ties the two by construction.
+`settle` and `release` never raise because of Redis or pricing once the call
+is paid for. Turning a paid answer into an error page helps nobody. Instead
+the estimate stays charged, the failure is logged, and a `store_error` or
+`pricing_failed` event is emitted. They do raise on programmer errors, such as
+settling twice or passing a negative cost.
 
-The work function must let failures escape. If it catches everything and returns
-normally, the envelope never sees a failure: retry, backoff and dead-letter
-become dead code, and the job records success for work that failed.
+## Pricing
 
-`marcar`, `ler`, `registrar` and `descartar` are synchronous SQLAlchemy calls.
-arq runs up to `max_jobs` jobs concurrently on a single event loop, so a
-progress tick blocks its siblings and the worker health check for the duration
-of the round trip. With a local PostgreSQL that is microseconds and does not
-matter. Otherwise use the async twins, which run the same call off the loop:
+pennyguard ships no prices. A bundled table goes stale the week a provider
+changes a price, and a stale price in a spending cap undercharges silently.
 
 ```python
-from agent_ops.queue import aio as queue_aio
+from pennyguard import Price, Pricing
 
-await queue_aio.marcar(engine, job_id, estado="rodando", percentual=0)
+# Your own table, in dollars per million tokens.
+pricing = Pricing({
+    "claude-opus-5-5": Price(4, 20, cache_read_per_mtok="0.20"),
+    "gpt-4o": Price(2.5, 10, cache_read_per_mtok=1.25),
+})
+
+# Or LiteLLM's community-maintained table, with your own entries on top.
+pricing = Pricing.from_litellm("model_prices_and_context_window.json").with_prices({
+    "my-fine-tune": Price(3, 12),
+})
 ```
 
-Every database function has one, in `decisions.aio` and `queue.aio`, with the
-same name and the same signature. They are `asyncio.to_thread` wrappers rather
-than a second SQL implementation over `AsyncEngine`, which would mean
-maintaining two versions of every statement and forcing an async driver on the
-consumer. A test asserts that no signature drifts and that no database function
-is left without a twin.
+* **Versioned names** resolve to their base entry when the suffix is a date,
+  a version or `latest`: `gpt-4o-2024-08-06` finds `gpt-4o`. A different model
+  never matches by prefix: `gpt-4o-mini` does not fall back to `gpt-4o`.
+* **Unknown models** raise `UnknownModel` from `Pricing.price`. At settle time
+  the guard keeps the estimate instead and emits `pricing_failed`. Pass
+  `default=Price(...)` to price unknown models conservatively instead.
+* **Missing cache prices default upward**: a cache read costs the input
+  price, a cache write 1.25 times it, and a one-hour cache write (Anthropic's
+  `ttl: "1h"`, reported under `usage.cache_creation`) twice it.
+* **Long-context tiers** (`above={200_000: Price(...)}`) price the whole call at
+  the tier once the prompt passes the threshold, cached tokens included.
+  `from_litellm` reads them from the `*_above_<N>k_tokens` fields.
+* **Dearer rates** such as Anthropic's fast mode or OpenAI's priority tier are
+  read from the response into `Usage.tier` and priced from
+  `variants={"fast": Price(...)}`. A dearer rate with no variant is refused
+  rather than billed at the standard price. `from_litellm` reads OpenAI's
+  priority and flex rates.
+* **Estimates** (`guard.estimate(model, input_tokens=..., max_output_tokens=...)`)
+  price every input token at the dearest of the input and cache-write
+  prices, and assume the full `max_output_tokens`, thinking included. Pass
+  `tier="fast"` (or another variant) when the call runs at that rate. With
+  refusal fallbacks a declined call is billed twice, so add the fallback
+  model's estimate if overshoot matters (the FastAPI example does).
 
-### Reading progress
+## Reading usage from responses
 
-```python
-p = queue.ler(engine, job_id)
-# None            -> never marked (or the read failed; check the log)
-# p["estado"]     -> pendente | rodando | concluido | falhou | descartado
-# p["percentual"] -> preserved on dead-letter: a job that died at 80% shows 80%
-# p["detalhe"]    -> the sentence the UI displays
-# p["tentativas"] -> retries of the job, not progress updates
-# p["atualizado"] -> when it last changed
-```
+`settle_response` and `Usage.all_from_response` read Anthropic Messages, OpenAI
+Chat Completions and OpenAI Responses objects, or the same shapes as dicts.
 
-Omitting `percentual` or `detalhe` in `marcar` preserves the stored value;
-passing them overwrites. Only omission preserves, so a progress tick does not
-erase the last message, and a dead-letter does not erase how far the job got.
-Passing `percentual=0` does write zero, because a retry legitimately restarts
-the bar.
+* Anthropic reports uncached input, cache reads and cache writes separately.
+  OpenAI includes cached tokens in `prompt_tokens` and repeats them under
+  `prompt_tokens_details`. Both map to one `Usage` shape so nothing is counted
+  twice and cache writes are not missed.
+* **Anthropic refusal fallbacks.** With server-side `fallbacks`, a declined
+  attempt and the fallback model's answer are billed separately, each at its
+  own model's rate, and the top-level `usage` covers only the answer. Every
+  attempt is listed in `usage.iterations`, and pennyguard prices each one
+  under its own model. A declined attempt that produced no output is billed
+  only for some refusal categories; pennyguard counts it regardless, which
+  errs toward overcounting. Server-side compaction iterations are counted the
+  same way.
 
-`tentativas` follows the same rule and is never auto-incremented. It counts
-retries of the job, reported by the worker from `ctx["job_try"]`. Incrementing
-it inside `marcar` would make the column count screen refreshes.
+## Errors and HTTP status codes
 
-`atualizado` is returned because without it, "running for ten seconds" and
-"running since the worker took a SIGKILL an hour ago" look identical, and the
-second is the one somebody needs to see.
-
-### The operations view
-
-`ler` answers for one job, which is what a client polling its own upload needs.
-Operating the queue needs the opposite questions:
-
-```python
-from agent_ops import queue
-
-queue.listar_por_estado(engine, "descartado", limite=50)
-queue.travados(engine, mais_velho_que_segundos=1800)
-```
-
-`listar_por_estado` sweeps the dead letter, newest first. `travados` finds jobs
-stalled in a state, oldest first, which in practice means `rodando` with a
-stale `atualizado`: the worker took a SIGKILL mid-flight. Nothing in arq
-reports that, because from its point of view the job was delivered, so without
-this query the row stays `rodando` forever.
-
-Both raise on a database failure, unlike `ler`. An empty dead letter caused by
-an outage says "nothing died", which is the most expensive wrong answer that
-screen can give.
-
-Neither takes a tenant, because `job_progress` has no tenant column. The job id
-carries the tenant, so filter on it yourself if an operations view is exposed
-to customers rather than to operators.
-
----
-
-## API reference
-
-The identifiers are in Portuguese and are not translated, so each table gives
-the English meaning of every name next to it: `consumir` means consume quota,
-`enfileirar` means enqueue, `marcar` means mark progress. Everything below is
-re-exported from its subpackage, so `from agent_ops import metering, decisions,
-queue` reaches all of it. The signatures match the source, with the
-`LIMITE_PADRAO` and `LOTE_PADRAO` defaults written out as 50 and 1000.
-
-"Never" in the Raises column means a backend failure is logged and swallowed.
-Database errors are SQLAlchemy's own exceptions, and Redis errors are
-redis-py's.
-
-### `agent_ops.metering`
-
-```python
-async def consumir(tipo: str, limite: int, unidades: int = 1,
-                   escopo: str | None = None) -> int: ...
-async def devolver(tipo: str, unidades: int = 1,
-                   escopo: str | None = None) -> None: ...
-async def panorama(limites: dict[str, int],
-                   escopo: str | None = None) -> dict[str, Any]: ...
-async def fechar() -> None: ...
-def segundos_ate_meia_noite_utc() -> int: ...
-
-class TetoAtingido(Exception):            # .mensagem: str
-    def __init__(self, mensagem: str): ...
-class TetoIndisponivel(TetoAtingido): ...
-```
-
-| Name | Meaning | What it does | Raises |
-|---|---|---|---|
-| `consumir` | consume quota | Reserves `unidades` of today's `tipo` quota, per `escopo` when given, before the paid call. Returns the units left | `TetoAtingido` at the cap or with the kill switch on, `TetoIndisponivel` when Redis is unreadable, `ValueError` for `unidades <= 0` or a `:` in `tipo`. A refused call charges nothing |
-| `devolver` | refund quota | Gives units back when the paid call did not happen. Best effort, and never takes the counter below zero | `ValueError` for `unidades <= 0` or a `:` in `tipo`. Never on a backend failure |
-| `panorama` | overview | Today's usage for a health check, with the keys `date`, `escopo`, `kill_switch`, `degraded`, `used`, `limits` and `remaining` | Never. With Redis down it returns the same shape, `degraded: True` and zeroed counters |
-| `fechar` | close | Closes the Redis client at shutdown and releases the singleton; the next call opens a new one | Never |
-| `segundos_ate_meia_noite_utc` | seconds until UTC midnight | The value for `Retry-After` when the cap is hit, never below 1 | Never |
-| `TetoAtingido` | cap reached | Exception with a message safe to show the visitor in `.mensagem`. Answer 429 | |
-| `TetoIndisponivel` | cap unavailable | Subclass of `TetoAtingido` for an unreadable backend. Answer 503, and catch it first | |
-| `cotas` | quotas | The module that implements everything above | |
-
-```python
-left = await metering.consumir("pdf", limite=1_000, unidades=page_count)
-await metering.consumir("chat", limite=20, escopo=f"ip:{client_ip}")
-```
-
-### `agent_ops.decisions`
-
-```python
-def digerir(payload: str | bytes) -> str: ...
-def registrar(
-    engine: Engine, *, tenant_id: str, correlation_id: str, input_digest: str,
-    rule_code: str, evidence: dict[str, Any] | None = None,
-    outcome: dict[str, Any] | None = None, model: str | None = None,
-    tokens_in: int = 0, tokens_out: int = 0, cost_cents: int = 0,
-    parent_id: str | None = None,
-) -> str | None: ...
-def listar(engine: Engine, *, tenant_id: str, limite: int = 50,
-           antes_de: datetime | None = None) -> list[dict[str, Any]]: ...
-def por_execucao(engine: Engine, *, tenant_id: str, correlation_id: str,
-                 limite: int = 500) -> list[dict[str, Any]]: ...
-def filhos(engine: Engine, *, tenant_id: str, parent_id: str,
-           limite: int = 500) -> list[dict[str, Any]]: ...
-def contagem_por_regra(engine: Engine, *,
-                       desde: datetime | None = None) -> dict[str, int]: ...
-def purgar(engine: Engine, *, antes_de: datetime, tenant_id: str | None = None,
-           limite: int = 1000) -> int: ...
-
-# agent_ops.decisions.migracao
-def aplicar(engine: Engine) -> None: ...
-SQL_SCHEMA: str
-```
-
-| Name | Meaning | What it does | Raises |
-|---|---|---|---|
-| `digerir` | digest | SHA-256 hex of the input. A `str` is encoded as UTF-8 first, so the same content as text and as bytes gives the same digest | |
-| `registrar` | record | Appends one row to the trail under the configured project, stamped in UTC. Returns the new row id, or `None` when the write failed | Never |
-| `listar` | list | The tenant's decisions, newest first. To page, pass the last `created_at` you saw as `antes_de` | Database errors, `ValueError` for `limite <= 0` |
-| `por_execucao` | by run | Every decision of one run (`correlation_id`) within the tenant, oldest first | Database errors, `ValueError` for `limite <= 0` |
-| `filhos` | children | The decisions whose `parent_id` is the given id, one level deep | Database errors, `ValueError` for `limite <= 0` |
-| `contagem_por_regra` | count per rule | `{rule_code: count}` for the configured project, since `desde` when given. Counts only, no rows | Database errors |
-| `purgar` | purge | Deletes up to `limite` rows older than `antes_de`, for one tenant when `tenant_id` is given. Returns how many went; loop until it returns 0 | Database errors, `ValueError` for `limite <= 0` |
-| `migracao.aplicar` | apply | Creates the `decisions` table and its indexes. Idempotent, safe on every boot | Database errors |
-| `migracao.SQL_SCHEMA` | | The packaged DDL, as text | |
-| `consultas`, `registro`, `migracao` | queries, recording, migration | The modules behind the functions above | |
-
-The reads return one dict per row with every column, and `evidence` and
-`outcome` parsed back into dicts. `antes_de` and `desde` are naive UTC
-datetimes, the same as what is stored.
-
-```python
-decisions.digerir("same text") == decisions.digerir(b"same text")   # True
-```
-
-### `agent_ops.queue`
-
-```python
-async def criar_pool() -> ArqRedis: ...
-async def enfileirar(pool: Pool, funcao: str, *args: Any, digest: str,
-                     tenant: str | None = None, **kwargs: Any) -> str | None: ...
-def job_id_de(digest: str, tenant: str | None = None) -> str: ...
-async def profundidade(pool: Pool) -> int: ...
-
-def aplicar_schema(engine: Engine) -> None: ...
-def marcar(engine: Engine, job_id: str, *, estado: str,
-           percentual: int | None = None, detalhe: str | None = None,
-           tentativas: int | None = None) -> None: ...
-def ler(engine: Engine, job_id: str) -> dict[str, Any] | None: ...
-def descartar(engine: Engine, job_id: str, *, motivo: str) -> None: ...
-def listar_por_estado(engine: Engine, estado: str, *,
-                      limite: int = 50) -> list[dict[str, Any]]: ...
-def travados(engine: Engine, *, mais_velho_que_segundos: int,
-             estado: str = "rodando",
-             limite: int = 50) -> list[dict[str, Any]]: ...
-def purgar(engine: Engine, *, antes_de: datetime,
-           estados: Iterable[str] = ESTADOS_TERMINAIS,
-           limite: int = 1000) -> int: ...
-
-def backoff(job_try: int) -> int: ...
-def tentar_de_novo(ctx: dict[str, Any]) -> None: ...
-def esgotou(ctx: dict[str, Any], max_tries: int = MAX_TENTATIVAS) -> bool: ...
-
-ESTADOS: frozenset[str]
-ESTADOS_TERMINAIS: frozenset[str]
-MAX_TENTATIVAS: int
-
-class FilaCheia(Exception):               # .mensagem: str, .retry_after: int
-    def __init__(self, mensagem: str, retry_after: int = 30): ...
-class FilaIndisponivel(FilaCheia): ...
-```
-
-`Pool` is `agent_ops.queue.fila.Pool`, a protocol that any arq pool satisfies:
-it only needs `zcard` and `enqueue_job`. `ctx` is the dict arq passes to the
-job function.
-
-| Name | Meaning | What it does | Raises |
-|---|---|---|---|
-| `criar_pool` | create pool | Opens the arq pool for the side that enqueues, from `AGENT_OPS_REDIS_URL`. Once per process | Redis connection errors |
-| `enfileirar` | enqueue | Enqueues `funcao(*args, **kwargs)` with the job id `projeto:tenant:digest`. Returns the id, or `None` when that job is already queued or running, which is success | `FilaCheia` at `AGENT_OPS_PROFUNDIDADE_MAXIMA`, `FilaIndisponivel` when Redis cannot be read or written, `ValueError` for a `:` in `tenant` or `digest` |
-| `job_id_de` | job id of | The id `enfileirar` gives this work, computed without enqueueing, so the client gets an id on the duplicate path too | `ValueError` for a `:` in `tenant` or `digest` |
-| `profundidade` | depth | How many jobs wait in the pool's own queue | Redis errors, untranslated |
-| `aplicar_schema` | apply schema | Creates the `job_progress` table. Idempotent; call it on web and worker boot | Database errors |
-| `marcar` | mark | Upserts a job's progress. An omitted `percentual`, `detalhe` or `tentativas` keeps the stored value | `ValueError` for a state outside `ESTADOS`. Never on a database failure |
-| `ler` | read | The job's progress row, or `None` when it was never marked | Never. A failed read also returns `None` |
-| `descartar` | discard | Dead-letters the job: `estado="descartado"` with `motivo` as `detalhe`, keeping the last `percentual` | Never |
-| `listar_por_estado` | list by state | Jobs in one state, newest first. Built for sweeping `descartado` | Database errors, `ValueError` for an unknown state or `limite <= 0` |
-| `travados` | stalled | Jobs left in `estado` for longer than `mais_velho_que_segundos`, oldest first | Database errors, `ValueError` for an unknown state, a window `<= 0` or `limite <= 0` |
-| `purgar` | purge | Deletes up to `limite` progress rows older than `antes_de` whose state is in `estados`, terminal states by default. Returns how many went; loop until it returns 0 | Database errors, `ValueError` for an empty or unknown `estados` or `limite <= 0` |
-| `backoff` | backoff | Seconds before try `job_try` runs again: 5, 10, 20, 40, and so on up to 300 | |
-| `tentar_de_novo` | try again | Hands the job back to arq with a `backoff(ctx["job_try"])` delay | Always `arq.Retry`, which is how arq receives it |
-| `esgotou` | exhausted | `True` on the last allowed try, when the caller should `descartar` instead | |
-| `ESTADOS` | states | `pendente`, `rodando`, `concluido`, `falhou`, `descartado` | |
-| `ESTADOS_TERMINAIS` | terminal states | `concluido`, `falhou`, `descartado`, the default of `purgar` | |
-| `MAX_TENTATIVAS` | max tries | `5`. Set `WorkerSettings.max_tries` to this constant | |
-| `FilaCheia` | queue full | Exception with `.mensagem` and `.retry_after` (30 by default). Answer 429 with `Retry-After` | |
-| `FilaIndisponivel` | queue unavailable | Subclass of `FilaCheia` for a queue that cannot be read or written. Answer 503, and catch it first | |
-| `fila`, `execucao` | queue, execution | The modules behind the functions above | |
-
-```python
-queue.job_id_de(digest, tenant="acme")           # "<AGENT_OPS_PROJETO>:acme:<digest>"
-[queue.backoff(n) for n in range(1, 8)]          # [5, 10, 20, 40, 80, 160, 300]
-```
-
-### Async twins
-
-`decisions.aio` and `queue.aio` hold an `async def` for every database function,
-with the same name and signature. Each one runs the synchronous function through
-`asyncio.to_thread`, so it raises exactly what that function raises.
-
-| Module | Functions |
-|---|---|
-| `decisions.aio` | `aplicar` (the twin of `migracao.aplicar`), `registrar`, `listar`, `por_execucao`, `filhos`, `contagem_por_regra`, `purgar` |
-| `queue.aio` | `aplicar_schema`, `marcar`, `ler`, `descartar`, `listar_por_estado`, `travados`, `purgar` |
-
-```python
-from agent_ops.decisions import aio as decisions_aio
-
-rows = await decisions_aio.listar(engine, tenant_id=user_id)
-```
-
-### Package and support modules
-
-Not re-exported by a subpackage, but used in the examples above.
-
-| Name | Meaning | What it does |
+| Exception | Meaning | Answer with |
 |---|---|---|
-| `agent_ops.__version__` | | The installed version, read from the package metadata |
-| `agent_ops.config.get_config() -> Config` | get config | The settings from [Configuration](#configuration), read once and cached |
-| `agent_ops.config.kill_switch_ligado() -> bool` | kill switch on | Reads `AGENT_OPS_KILL_SWITCH` on every call, bypassing the cache |
-| `agent_ops.tempo.agora_utc() -> datetime` | now in UTC | The current time as a naive UTC `datetime`, the clock behind every stored timestamp |
+| `BudgetExceeded` | A budget lacks room. `.budget`, `.scope`, `.spent_usd`, `.limit_usd`, `.requested_usd`, `.resets_at`, `.retry_after` | 429, `Retry-After: retry_after` (none for `"total"` budgets) |
+| `GuardKilled` | The kill switch is on. `.reason` | 503 |
+| `GuardUnavailable` | Redis could not be read, so the call is refused | 503 |
+| `UnknownModel` | No price for a model (from `Pricing`; never raised by settle) | |
 
----
+All four derive from `PennyGuardError`. `fail_open=True` makes an unreadable
+Redis allow the call instead of refusing it; the cost is still recorded at
+settle time if Redis is back by then. The default refuses, because an
+unreadable budget is not an absent budget.
 
-## Design decisions
-
-The choices a reviewer is most likely to question, and why they are what they
-are.
-
-Fail closed for anything that gates money or work; fail open for anything that
-only reports. `consumir` and `enfileirar` refuse when their backend is
-unreadable. `devolver`, `panorama`, `registrar`, `marcar` and `ler` never raise
-on a backend failure. The rule is consistent across all three subpackages: if it
-authorizes, it refuses under uncertainty; if it observes, it degrades.
-
-The one exception is programmer error. An invalid state name, a non-positive
-unit count, a colon inside a key field: these raise `ValueError`, because they
-surface in the first test run and never during a traffic spike.
-
-Two exception types where one would be simpler. `TetoIndisponivel` and
-`FilaIndisponivel` subclass their respective limit exceptions. Without them a
-caller cannot distinguish "you hit the limit" (429, resets at a known time) from
-"the backend is unreadable" (503, nobody knows when). Collapsing both into one
-type means every dashboard reports saturation during an outage.
-
-A production bug found during extraction. The original spend cap had `INCR` and
-`EXPIRE` inside the same `try`. If `INCR` succeeded and `EXPIRE` then failed, a
-transient blip between two round trips, execution fell into the generic handler
-and raised without undoing the increment. A refused call charged the next
-visitor's quota. The first fix separated the two error scopes: the TTL is
-housekeeping, not correctness, so a failure there logs and continues. Since
-0.3.0 the increment, the TTL and the compensation run in one Lua script, where
-`EXPIRE` goes through `redis.pcall` so that its error cannot abort the script
-after the increment is written. Two tests against a real Redis make `EXPIRE`
-fail inside that script, and both fail if `pcall` is replaced with `call`.
-
-Subpackages do not import each other. `metering` pulls no SQLAlchemy. A test
-pins the actual import cost of each subpackage, including the one case where the
-cost is real: `queue` does load SQLAlchemy, because its durable half is a
-PostgreSQL table, and the test asserts that rather than wishing otherwise.
-
-The schema is portable by construction, not by translation. Plain `TEXT` and
-`INTEGER` rather than native `UUID` and `JSONB`, so the same DDL file runs on
-PostgreSQL and SQLite. One schema, no drift.
-
-The DDL ships as a `.sql` file rather than a Python string. It stays reviewable
-as SQL, it colorizes in an editor, and an operator can run it by hand against
-production without booting the application.
-
-No migration framework. Both schemas are `CREATE TABLE IF NOT EXISTS` plus
-`CREATE INDEX IF NOT EXISTS`, applied by the host application at boot with its
-own engine. The package never owns a connection. Adding a column is meant to be
-deliberate: it breaks the column-set test, which is the point.
-
----
-
-## Operating notes
-
-Things that are correct in code and still need a decision from whoever runs it.
-
-Timestamps are UTC regardless of how your database is configured, and you do
-not have to arrange that. `created_at` and `atualizado` are stamped in UTC from
-Python rather than taken from the database default, because
-`CURRENT_TIMESTAMP` into a column without a time zone resolves to UTC on SQLite
-and to the session time zone on PostgreSQL. The DDL keeps its default as a
-fallback for hand-written SQL, so an `INSERT` you run yourself against a
-database in a local zone still stores local time. Both columns read back as
-naive UTC `datetime` on both backends.
-
-Schedule the retention job. Nothing deletes on its own. `decisions` grows per
-decision rather than per request, so an orchestrator that spawns five workers
-writes six rows, and `job_progress` keeps one row per job forever. Both
-`purgar` functions delete in batches and return how many rows went, so the
-caller loops:
+## Kill switch
 
 ```python
-from datetime import timedelta
-from agent_ops import decisions, queue
-from agent_ops.tempo import agora_utc
-
-corte = agora_utc() - timedelta(days=365)
-while decisions.purgar(engine, antes_de=corte):
-    pass
-while queue.purgar(engine, antes_de=agora_utc() - timedelta(days=30)):
-    pass
+await guard.kill("runaway agent, investigating")   # every process, immediately
+await guard.resume()
+await guard.killed()                               # the reason, or None
 ```
 
-Batching is not a detail. An unbounded `DELETE` on a table that only grows
-holds the transaction and the write-ahead log for the whole scan, which turns
-the cure into the outage that retention existed to prevent.
-
-`queue.purgar` leaves `pendente` and `rodando` alone unless you name them
-explicitly. A job stuck in `rodando` with a stale timestamp is exactly what
-`travados` exists to surface, and sweeping the row away resolves the symptom by
-destroying the evidence while the work stays lost.
-
-`decisions.purgar` also takes an optional `tenant_id`, which answers a
-different question: erasure on request rather than retention by age. Pass an
-`antes_de` later than the tenant's newest row, such as the current time, and
-loop until it returns zero.
-
-The Redis client is a process-level singleton created on first use. It stays
-open until `metering.fechar()` closes it, as described under
-[Shutdown](#shutdown). A service that never calls `fechar` works, with two
-costs: a process that runs more than one event loop over its lifetime, such as
-a script calling `asyncio.run` twice, finds the client bound to the first loop
-unless `fechar` runs in between, and an interpreter exiting under load may log
-an unclosed-connection warning.
-
-Queue depth counts every job in arq's sorted set, which includes deferred jobs
-and jobs waiting out a retry backoff. During a provider outage, retrying jobs
-raise the measured depth and the API starts shedding new work sooner. That is
-usually the behavior you want, but it is not the same number as "jobs waiting
-right now".
-
-The depth check and the enqueue are two round trips, so the cap is soft.
-Concurrent requests can each see room and each enqueue, overshooting the cap by
-roughly the concurrency level. For backpressure that is fine; do not read
-`profundidade_maxima` as a hard bound.
-
-The Redis server must allow `EVAL`. Quota reservation is a Lua script, which
-is standard Redis and has been since 2.6, but a few managed offerings and
-proxies disable scripting. If yours does, `consumir` fails closed and refuses
-every call rather than quietly falling back to something weaker.
-
-A digest is not anonymization. `digerir` hashes whatever you give it. Hashing a
-document is fine, since guessing it is infeasible. Hashing a low-entropy
-identifier, an email address or a national id number, produces a digest that can
-be reversed by enumeration, and under most privacy regimes a value that still
-singles out a person remains personal data. Digest the content, not the
-identity.
-
-`ler` trusts the job id it is given. The id embeds the tenant, which is what
-separates two tenants who uploaded byte-identical files, so never pass a
-client-supplied job id through without checking that its tenant field matches
-the caller. The progress table has no tenant column to catch it for you.
-
----
-
-## Testing
-
-194 tests. 176 of them run with no Redis, no PostgreSQL, no network and no
-provider key. Async functions are tested with `asyncio.run()` and hand-written
-doubles rather than a plugin, to avoid adding a test dependency the consuming
-applications do not already have.
-
-Those 176 run in under a second, which matters more than it sounds: a test
-suite that needs infrastructure is a test suite that gets skipped. The other
-18 need real services and are described below.
+The flag lives in Redis and is checked inside the reservation script, so it
+costs no extra round trip and takes effect on the next reservation of every
+process, without a restart or a deploy. From a shell during an incident:
 
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/ -q
-ruff check src/ tests/
-mypy
+redis-cli SET 'pg:{docs-qa}:kill' 'cost spike'
 ```
 
-`ruff` and `mypy` in strict mode both run clean and both gate CI. Strict is
-worth the cost in a package other code imports: without it the annotations
-serve the reader and not the caller, and `py.typed` would export promises
-nobody checks.
+## Status and observability
 
-CI runs three jobs: the full suite against real PostgreSQL and Redis, `ruff`
-and `mypy`, and a wheel build installed into a clean virtualenv that asserts
-the packaged `.sql` files and `py.typed` are present. An editable install
-resolves those from the source tree regardless, so without the wheel job the
-package could stop being installable with CI fully green.
+`await guard.status(tenant="acme")` returns, for every global budget and every
+budget whose dimension you name: spent, limit, remaining and when it resets.
+It suits a health endpoint or a "you have $1.20 left today" badge.
 
-A dedicated test pins the public surface of all three subpackages. The consuming
-application migrates by changing an import line, so a silent rename from
-`consumir` to `consume` has to break here rather than at someone's deploy.
+Every reservation, refusal, settlement and failure goes to `on_event`:
 
-Two more files run the same code against real PostgreSQL (8 tests) and real
-Redis (10 tests), and skip when `AGENT_OPS_TEST_POSTGRES_URL` and
-`AGENT_OPS_TEST_REDIS_URL` are unset, so the fast path stays fast. CI sets both
-and fails if those tests skip, because a typo in a variable name would turn
-that whole coverage into a silent pass.
+```python
+guard = Guard(store, budgets, on_event=lambda event: log.info("%s", event))
+```
 
-The Redis file exists because the double cannot execute Lua and cannot be
-concurrent. What runs in the fast suite is a model of the reservation script;
-the real file runs the script. It also runs the test a sequential double can
-never perform: 50 simultaneous reservations against a cap of 10. With a
-non-atomic check-then-reserve, all 50 get through.
+An `Event` carries the kind, project, reservation id, scope, your `tags`, the
+amount, and for settlements the usage and cost of every billed attempt. The
+hook's own errors are logged and swallowed.
 
-It also makes `EXPIRE` fail inside the script, by sending a TTL the server
-rejects, and checks that the reservation stands and that a refused call is
-still compensated. The fast suite cannot cover this. Its model of the script
-swallows the `EXPIRE` error on its own, so replacing `redis.pcall` with
-`redis.call` in the script left every fast test green.
+For OpenTelemetry metrics (`pip install "pennyguard[otel]"`):
 
-That fixture pins the session time zone to `America/Bahia` on purpose. The
-official PostgreSQL image boots in UTC, and in UTC the defect these tests exist
-for does not reproduce: `CURRENT_TIMESTAMP` coincides with UTC and everything
-goes green by accident. An offset is what gives the test a chance to fail.
+```python
+from pennyguard.otel import metrics_hook
+
+guard = Guard(store, budgets, on_event=metrics_hook(scope_keys=["tenant"], tag_keys=["route"]))
+```
+
+This records `pennyguard.cost` (USD, by model), `pennyguard.tokens` (by model
+and token type) and `pennyguard.refusals` (by budget, `killed` or
+`unavailable`). Scope and tag attributes are opt-in because a per-user
+attribute on a metric multiplies its time series by the number of users.
+
+## Running it in production
+
+* **Pass your own Redis client.** Its pool, timeouts, TLS and retry settings
+  stay yours, and either `decode_responses` setting works.
+* **Timeouts and retries are safe.** Every reservation has an id and a small
+  marker key, `pg:{project}:op:<id>`, recording what it has charged. Running
+  a reservation twice charges once, and settling moves the charge to a
+  target rather than by a delta, so redis-py's retry of a command that timed
+  out (the default from version 6) cannot double-charge. If a reservation's
+  reply is lost, the guard settles it to zero before raising
+  `GuardUnavailable`; with `fail_open`, the later settle lands on the real
+  cost whether or not the lost reservation went through.
+* **`reservation_ttl`** (six hours by default) is how long an unsettled
+  reservation stays settleable. A settle after that records the real cost
+  on top of the estimate instead of replacing it: an overcount, never an
+  undercount. Raise it for agent tasks that hold one reservation longer.
+  Settled reservations keep their marker for five minutes.
+* **Redis Cluster** works: every key of a project carries the same hash tag,
+  `pg:{project}:...`, which a multi-key script requires.
+* **The server must allow `EVAL`.** A few managed offerings disable scripting;
+  there every reservation is refused (or allowed, with `fail_open`) rather
+  than checked non-atomically.
+* **Keys expire on their own**, after two windows of inactivity (62 days for
+  monthly budgets). `"total"` budgets never expire.
+* **`project`** namespaces every key, so several apps can share one Redis.
+* **`MemoryStore` is per process.** Behind several workers each one gets the
+  full budget; use it for tests, scripts and single-process apps.
+
+## Limitations
+
+* **Your estimate bounds the overshoot.** A call that costs more than its
+  reservation is recorded in full but was already allowed. Concurrent calls
+  can each overshoot by their own difference. `guard.estimate` with the
+  call's `max_tokens` and rate bounds one attempt; a refusal fallback adds a
+  second attempt.
+* **A provider error in the middle of a stream releases the reservation.**
+  An exception with an HTTP status means "not billed" to pennyguard, which
+  holds before the first token and not after it. Settle with the usage you
+  have, or call `settle(cost_usd=...)`, if partial streams matter to you.
+* **Fixed windows, not rolling ones.** A day budget can be spent at 23:59 and
+  again at 00:01. Pair a day budget with an hour budget if bursts matter.
+* **Prices are your responsibility.** pennyguard computes from the table you
+  give it. Batch discounts are not modeled (a batch call is charged at the
+  standard rate, which overcounts). Fees outside tokens, such as web search
+  per query or code execution time, are not priced; settle with `cost_usd`
+  if you use them.
+* **Refusals before output are counted** even in the refusal categories
+  Anthropic does not bill.
+* **No rolling history.** Counters hold the current window only. For
+  per-call history, send events to your logs or metrics.
+
+## Development
 
 ```bash
-AGENT_OPS_TEST_POSTGRES_URL=postgresql+psycopg://user:pass@localhost/db \
-AGENT_OPS_TEST_REDIS_URL=redis://localhost:6379/15 \
-  python -m pytest tests/ -q
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest
+PENNYGUARD_TEST_REDIS_URL=redis://localhost:6379/15 .venv/bin/python -m pytest   # with Redis
+.venv/bin/ruff check src tests examples && .venv/bin/mypy
 ```
 
----
+The suite runs in under a second without Redis. The Redis tests run the Lua
+scripts themselves: fifty concurrent reservations from separate clients
+against room for ten, a script run twice that must charge once, and
+regressions that fail if `redis.pcall` around `EXPIRE` becomes `redis.call`,
+if the floor at zero goes, or if settling reverts to a delta. CI runs them
+against a real Redis on Python 3.11, 3.12 and 3.13, and fails if any of them
+is skipped.
 
-## Known limitations
+### History
 
-Stated plainly, because a library that hides its limits wastes your time.
-
-No cross-request deduplication by content. The digest identifies whatever you
-hash. If you hash per-request identifiers, re-submitting the same file runs
-again. Content-addressed dedup needs a `(tenant, content_digest)` row consulted
-before the quota is charged, which is the application's decision, not this
-package's.
-
-Deduplication is time-bounded. arq drops a duplicate only while the job or its
-result key lives, and `keep_result` is one hour by default. After that the same
-digest enqueues again and the work is repeated, and recharged.
-
-Timeouts do not reach the dead-letter. `descartar` runs from inside your work
-function, so it only sees exceptions your function raised. A job cancelled by
-`job_timeout` is retried by arq, and once `job_try` passes `max_tries` arq
-finishes it without calling the function at all. Such a job never gets a
-`descartado` row; find it by its stale `atualizado`.
-
-Refunds are keyed to the current UTC day, not to the day the quota was
-reserved. A refund for a call reserved just before UTC midnight lands on the
-new day's key, where it is floored at zero rather than credited. The refund is
-lost, which is the documented best-effort behavior for `devolver`, but it can
-no longer raise anyone's cap.
-
-Erasure on request covers the decision trail only. `decisions.purgar` takes a
-`tenant_id`, while `queue.purgar` has no tenant filter because `job_progress`
-has no tenant column. The tenant is the middle field of the job id
-(`projeto:tenant:digest`), so removing one tenant's progress rows means a
-`DELETE` on `job_id` that you write yourself.
-
-No fair-share scheduling. One tenant can occupy the whole worker pool. arq has
-no native support for it, and doing it properly means per-tenant queues and a
-scheduler, which is a larger piece of work than the rest of this package.
-
-No metrics. Everything is stdlib `logging` with dotted event names
-(`metering.esgotado`, `queue.cheia`, `decisions.gravacao_falhou`) and key=value
-pairs. There is no Prometheus exporter and no OpenTelemetry integration.
-
-It is not an agent framework, a prompt library, or a model router.
-
----
-
-## Versioning
-
-Semantic versioning, consumed by git tag. The version has a single source, the
-`version` field in `pyproject.toml`, read back at runtime through
-`importlib.metadata`. An earlier release shipped with the number written in two
-places and the two disagreeing, which is the failure mode that arrangement
-produces.
-
-Every release that changes what a pinned upgrade does to you is written down in
-[CHANGELOG.md](CHANGELOG.md).
-
-`0.3.0` fixed timestamps that were UTC in tests and local time in production,
-added the read API for the trail, and put PostgreSQL in CI. `0.2.0` changed
-`panorama` to take its limits as an argument instead of reading them from
-configuration, which is the one place the "names are preserved" guarantee does
-not hold.
-
-Pin the tag. Read the diff before moving it.
-
----
+This repository started as `agent-ops`, three primitives extracted from a
+production document Q&A service: a daily call counter, an append-only
+decision trail and a durable job queue. Version 0.4.0 keeps the idea that
+mattered (a spending cap that refuses rather than guesses) and rebuilds it as
+a dollar-denominated, multi-budget library. The earlier code remains
+installable from the `v0.3.0` tag, and [CHANGELOG.md](CHANGELOG.md) has the
+details.
 
 ## License
 
