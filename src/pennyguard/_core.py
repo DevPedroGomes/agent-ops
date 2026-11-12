@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -124,14 +125,18 @@ def freeze(mapping: Mapping[str, str] | None, what: str) -> Mapping[str, str]:
 # SDK is imported. Subclasses count: LiteLLM's errors derive from OpenAI's.
 _SDK_PACKAGES = frozenset({"anthropic", "openai"})
 _SDK_STATUS_ERROR = "APIStatusError"
+_SDK_CONNECTION_ERROR = "APIConnectionError"  # timeouts derive from it
+
+
+def _sdk_error(error: BaseException, name: str) -> bool:
+    return any(
+        cls.__name__ == name and cls.__module__.partition(".")[0] in _SDK_PACKAGES
+        for cls in type(error).__mro__
+    )
 
 
 def _sdk_status_error(error: BaseException) -> bool:
-    return any(
-        cls.__name__ == _SDK_STATUS_ERROR
-        and cls.__module__.partition(".")[0] in _SDK_PACKAGES
-        for cls in type(error).__mro__
-    )
+    return _sdk_error(error, _SDK_STATUS_ERROR)
 
 
 def _retried(error: BaseException) -> bool:
@@ -168,6 +173,66 @@ def provider_rejected(error: BaseException) -> bool:
     if not isinstance(status, int) or isinstance(status, bool) or status < 400:
         return False
     return not _retried(error)
+
+
+# The SDKs' own retry rules, so that retrying in guard.call behaves like the
+# retries it replaces.
+_RETRYABLE_STATUS = frozenset({408, 409, 429})
+_MAX_RETRY_AFTER = 60.0
+_BACKOFF_START = 0.5
+_BACKOFF_MAX = 8.0
+
+
+def _response_header(error: BaseException, name: str) -> str | None:
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except Exception:
+        return None
+    return None if value is None else str(value)
+
+
+def retry_delay(error: BaseException, attempt: int) -> float | None:
+    """Seconds to wait before retrying a call that raised ``error``, or
+    ``None`` when it should not be retried.
+
+    Retried, as the SDKs do: 408, 409, 429 and 5xx from the Anthropic or
+    OpenAI SDK, and their connection errors and timeouts, unless the
+    provider's ``x-should-retry`` header says otherwise. The wait is the
+    provider's ``retry-after`` when it asks for a minute or less, and
+    exponential backoff with jitter from half a second up to eight otherwise.
+    """
+    if _sdk_status_error(error):
+        should = _response_header(error, "x-should-retry")
+        if should == "false":
+            return None
+        status = getattr(error, "status_code", None)
+        retryable = isinstance(status, int) and (
+            status in _RETRYABLE_STATUS or status >= 500
+        )
+        if should != "true" and not retryable:
+            return None
+    elif not _sdk_error(error, _SDK_CONNECTION_ERROR):
+        return None
+    for name, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        raw = _response_header(error, name)
+        if raw is None:
+            continue
+        try:
+            seconds = float(raw) * scale
+        except ValueError:
+            continue  # an HTTP date: fall back to backoff
+        if 0 <= seconds <= _MAX_RETRY_AFTER:
+            return seconds
+    backoff = min(_BACKOFF_START * 2.0**attempt, _BACKOFF_MAX)
+    return backoff * (1 - 0.25 * random.random())
+
+
+def check_retries(retries: int) -> None:
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError(f"retries must be a non-negative int, got {retries!r}")
 
 
 class Core:

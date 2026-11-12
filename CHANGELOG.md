@@ -25,6 +25,10 @@ maintenance-only mode.
 * `Guard` (async) and `SyncGuard`: reserve an estimate before a call and
   settle the real cost after it. `call()` does both around one provider
   call, and releases the reservation when the provider refused the call.
+  `call(retries=N)` retries what the SDKs would (408, 409, 429, 5xx,
+  timeouts), honoring `retry-after`, with a reservation per attempt, so a
+  429 is refunded and a timeout keeps its estimate. `retries` is a reserved
+  name for budget dimensions.
 * `Budget`: a dollar limit over an `hour`, `day`, `month` or `total` UTC
   window, global or `per` a dimension such as tenant or user. A reservation is
   checked against every applicable budget and charged to all of them, or to
@@ -75,7 +79,8 @@ maintenance-only mode.
   `Price.cache_write_1h_per_mtok`), read from Anthropic's `cache_creation`
   breakdown and LiteLLM's `*_above_1hr` field.
 * Examples: an offline quickstart and a FastAPI app with per-tenant limits on
-  Claude calls.
+  Claude calls. Reference material lives in `docs/pricing.md` and
+  `docs/production.md`, so the README stays an overview.
 
 ### Removed
 

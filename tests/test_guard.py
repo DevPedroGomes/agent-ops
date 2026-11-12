@@ -284,10 +284,17 @@ class APIStatusError(Exception):
     and package. ``retries`` is what the SDK puts in the retry-count header
     of the attempt that failed."""
 
-    def __init__(self, status_code: int, retries: int = 0) -> None:
+    def __init__(
+        self, status_code: int, retries: int = 0, headers: dict[str, str] | None = None
+    ) -> None:
         super().__init__(f"HTTP {status_code}")
         self.status_code = status_code
         self.request = NS(headers={"x-stainless-retry-count": str(retries)})
+        # retry-after-ms 0 keeps retry tests from sleeping.
+        self.response = NS(
+            status_code=status_code,
+            headers={"retry-after-ms": "0"} if headers is None else headers,
+        )
 
 
 APIStatusError.__module__ = "anthropic._exceptions"
@@ -302,6 +309,13 @@ class OpenAIError(APIStatusError):
 
 
 OpenAIError.__module__ = "openai._exceptions"
+
+
+class APIConnectionError(Exception):
+    """Stands in for the SDKs' connection error, the base of their timeouts."""
+
+
+APIConnectionError.__module__ = "anthropic._exceptions"
 
 
 class HTTPException(Exception):
@@ -993,3 +1007,166 @@ class TestIdempotence:
         # records the cost on top of it: an overcount, never an undercount.
         store.settle("pg:{t}:op:1", [counter], 2, 300)
         assert store.read([counter.key]) == [7]
+
+
+class TestRetries:
+    def test_each_attempt_has_its_own_reservation(
+        self, store: MemoryStore, clock: Clock, events: list[Event], pricing: Pricing
+    ) -> None:
+        guard = make(store, clock, events, pricing=pricing)
+        errors = [ProviderError(429), ProviderError(529)]
+        calls: list[int] = []
+
+        def fn() -> NS:
+            calls.append(1)
+            if errors:
+                raise errors.pop(0)
+            return anthropic_response()
+
+        guard.call(fn, estimate_usd=1, retries=2)
+        assert len(calls) == 3
+        # Both rejected attempts were released; only the answer is charged.
+        assert spent(guard) == {"global": D("0.002")}
+        assert kinds(events) == [
+            "reserved",
+            "released",
+            "reserved",
+            "released",
+            "reserved",
+            "settled",
+        ]
+
+    def test_no_retry_by_default_or_on_a_client_error(
+        self, store: MemoryStore, clock: Clock, events: list[Event], pricing: Pricing
+    ) -> None:
+        guard = make(store, clock, events, pricing=pricing)
+        for error, retries in ((ProviderError(429), 0), (ProviderError(400), 2)):
+            calls: list[int] = []
+
+            def fn(error: Exception = error, calls: list[int] = calls) -> NS:
+                # Fails once only, so a guard that retries anyway succeeds.
+                calls.append(1)
+                if len(calls) == 1:
+                    raise error
+                return anthropic_response()
+
+            with pytest.raises(ProviderError):
+                guard.call(fn, estimate_usd=1, retries=retries)
+            assert len(calls) == 1
+        with pytest.raises(ValueError, match="retries"):
+            guard.call(anthropic_response, estimate_usd=1, retries=-1)
+        with pytest.raises(ValueError):
+            Budget("b", 1, per="retries")
+
+    def test_a_connection_error_is_retried_and_keeps_its_estimate(
+        self,
+        store: MemoryStore,
+        clock: Clock,
+        events: list[Event],
+        pricing: Pricing,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import pennyguard.guard as guard_module
+
+        real = guard_module.retry_delay
+        monkeypatch.setattr(
+            guard_module,
+            "retry_delay",
+            lambda error, attempt: None if real(error, attempt) is None else 0.0,
+        )
+        guard = make(store, clock, events, pricing=pricing)
+        errors: list[Exception] = [APIConnectionError()]
+
+        def fn() -> NS:
+            if errors:
+                raise errors.pop(0)
+            return anthropic_response()
+
+        guard.call(fn, estimate_usd=1, retries=1)
+        # The attempt that timed out may have been billed: its $1 stays.
+        assert spent(guard) == {"global": D("1.002")}
+        assert kinds(events) == ["reserved", "unsettled", "reserved", "settled"]
+
+    def test_a_retry_the_budget_has_no_room_for_is_refused(
+        self,
+        store: MemoryStore,
+        clock: Clock,
+        events: list[Event],
+        pricing: Pricing,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import pennyguard.guard as guard_module
+
+        monkeypatch.setattr(guard_module, "retry_delay", lambda error, attempt: 0.0)
+        guard = make(store, clock, events, Budget("global", "1.5"), pricing=pricing)
+
+        def fn() -> NS:
+            raise APIConnectionError
+
+        with pytest.raises(BudgetExceeded):
+            guard.call(fn, estimate_usd=1, retries=3)
+        assert spent(guard) == {"global": D(1)}
+
+    def test_retries_in_the_async_guard(
+        self, store: MemoryStore, clock: Clock, events: list[Event], pricing: Pricing
+    ) -> None:
+        guard = Guard(store, [Budget("g", 10)], clock=clock, pricing=pricing)
+        errors = [ProviderError(503)]
+
+        async def fn() -> NS:
+            if errors:
+                raise errors.pop(0)
+            return anthropic_response()
+
+        async def scenario() -> list[str]:
+            await guard.call(fn, estimate_usd=1, retries=1)
+            return [str(s.spent_usd) for s in await guard.status()]
+
+        assert asyncio.run(scenario()) == ["0.002"]
+
+
+class TestRetryDelay:
+    def test_follows_the_providers_retry_after(self) -> None:
+        from pennyguard._core import retry_delay
+
+        assert (
+            retry_delay(ProviderError(429, headers={"retry-after-ms": "1500"}), 0)
+            == 1.5
+        )
+        assert retry_delay(ProviderError(429, headers={"retry-after": "2"}), 0) == 2.0
+
+    def test_backs_off_when_retry_after_is_absent_or_too_long(self) -> None:
+        from pennyguard._core import retry_delay
+
+        for headers in ({}, {"retry-after": "120"}, {"retry-after": "Wed, 1 Jan"}):
+            delay = retry_delay(ProviderError(529, headers=headers), 0)
+            assert delay is not None
+            assert 0.375 <= delay <= 0.5
+        late = retry_delay(ProviderError(529, headers={}), 10)
+        assert late is not None
+        assert 6 <= late <= 8
+
+    @pytest.mark.parametrize(
+        ("error", "retried"),
+        [
+            (ProviderError(408, headers={}), True),
+            (ProviderError(409, headers={}), True),
+            (OpenAIError(429, headers={}), True),
+            (ProviderError(500, headers={}), True),
+            (APIConnectionError(), True),
+            (ProviderError(400, headers={}), False),
+            (ProviderError(404, headers={}), False),
+            (ProviderError(200, headers={}), False),
+            (ProviderError(429, headers={"x-should-retry": "false"}), False),
+            (ProviderError(400, headers={"x-should-retry": "true"}), True),
+            (HTTPException(503), False),
+            (TimeoutError(), False),
+            (asyncio.CancelledError(), False),
+        ],
+    )
+    def test_retries_what_the_sdks_retry(
+        self, error: BaseException, retried: bool
+    ) -> None:
+        from pennyguard._core import retry_delay
+
+        assert (retry_delay(error, 0) is not None) is retried

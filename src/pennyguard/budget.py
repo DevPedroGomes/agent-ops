@@ -19,7 +19,7 @@ _DIMENSION = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
 # Keyword arguments of reserve() and call(). A dimension with one of these
 # names could not be passed as a scope keyword.
-RESERVED_DIMENSIONS = frozenset({"estimate_usd", "fn", "tags"})
+RESERVED_DIMENSIONS = frozenset({"estimate_usd", "fn", "retries", "tags"})
 
 # A counter outlives its window by at least one full window after its last
 # write, so a settle that arrives late still finds the key it reserved on.

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
@@ -30,9 +31,11 @@ from pennyguard._core import (
     Event,
     Priced,
     ReservationState,
+    check_retries,
     freeze,
     new_reservation_id,
     provider_rejected,
+    retry_delay,
 )
 from pennyguard.budget import Budget
 from pennyguard.errors import GuardKilled, GuardUnavailable
@@ -376,6 +379,7 @@ class Guard:
         *,
         estimate_usd: Amount,
         tags: Mapping[str, str] | None = None,
+        retries: int = 0,
         **scope: str,
     ) -> T:
         """Reserve, run ``fn``, settle from its response, return the response.
@@ -385,19 +389,35 @@ class Guard:
         released. If it raises anything else, the estimate stays charged.
         The response must carry ``usage`` the way the Anthropic and OpenAI
         SDKs return it; for streams, use ``reserve``.
+
+        ``retries`` retries what the SDKs would (408, 409, 429, 5xx,
+        connection errors and timeouts), each attempt under a reservation
+        of its own: a rejected attempt is released and a timed-out one keeps
+        its estimate. Give the client ``max_retries=0`` so the SDK does not
+        retry underneath. A retry that the budget no longer has room for
+        raises ``BudgetExceeded``.
         """
         self._core.require_pricing("call()")
-        reservation = await self.reserve(estimate_usd, tags=tags, **scope)
-        try:
-            response = await fn()
-        except BaseException as exc:
-            if provider_rejected(exc):
-                await reservation.release()
-            else:
-                reservation._unsettled(exc)
-            raise
-        await reservation.settle_response(response)
-        return response
+        check_retries(retries)
+        attempt = 0
+        while True:
+            reservation = await self.reserve(estimate_usd, tags=tags, **scope)
+            try:
+                response = await fn()
+            except BaseException as exc:
+                if provider_rejected(exc):
+                    await reservation.release()
+                else:
+                    reservation._unsettled(exc)
+                delay = retry_delay(exc, attempt) if attempt < retries else None
+                if delay is None:
+                    raise
+                attempt += 1
+                logger.info("pennyguard.retry attempt=%d delay=%.2f", attempt, delay)
+                await asyncio.sleep(delay)
+                continue
+            await reservation.settle_response(response)
+            return response
 
     async def status(self, **scope: str) -> list[BudgetStatus]:
         """Spend and room left for the global budgets, plus every per-dimension
@@ -646,21 +666,31 @@ class SyncGuard:
         *,
         estimate_usd: Amount,
         tags: Mapping[str, str] | None = None,
+        retries: int = 0,
         **scope: str,
     ) -> T:
         """See ``Guard.call``."""
         self._core.require_pricing("call()")
-        reservation = self.reserve(estimate_usd, tags=tags, **scope)
-        try:
-            response = fn()
-        except BaseException as exc:
-            if provider_rejected(exc):
-                reservation.release()
-            else:
-                reservation._unsettled(exc)
-            raise
-        reservation.settle_response(response)
-        return response
+        check_retries(retries)
+        attempt = 0
+        while True:
+            reservation = self.reserve(estimate_usd, tags=tags, **scope)
+            try:
+                response = fn()
+            except BaseException as exc:
+                if provider_rejected(exc):
+                    reservation.release()
+                else:
+                    reservation._unsettled(exc)
+                delay = retry_delay(exc, attempt) if attempt < retries else None
+                if delay is None:
+                    raise
+                attempt += 1
+                logger.info("pennyguard.retry attempt=%d delay=%.2f", attempt, delay)
+                time.sleep(delay)
+                continue
+            reservation.settle_response(response)
+            return response
 
     def status(self, **scope: str) -> list[BudgetStatus]:
         """See ``Guard.status``."""

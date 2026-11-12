@@ -59,10 +59,10 @@ guard = Guard(
     project="docs-qa",
     pricing=pricing,
 )
-# The SDK retries 429, 5xx and timeouts by itself. A status error after one
-# of those retries keeps its estimate, since the attempt before it may have
-# been billed; see "SDK retries" in the README for the trade-off.
-client = anthropic.AsyncAnthropic()
+# guard.call retries instead of the SDK, one reservation per attempt, so a
+# 429 is refunded and a timeout keeps its estimate. Retries inside the SDK
+# would hide which of the two happened.
+client = anthropic.AsyncAnthropic(max_retries=0)
 
 
 @asynccontextmanager
@@ -103,6 +103,7 @@ async def ask(question: Question, x_tenant_id: str = Header()) -> dict[str, str]
             estimate_usd=estimate,
             tenant=x_tenant_id,
             tags={"route": "ask"},
+            retries=2,
         )
     except BudgetExceeded as exc:
         headers = {"Retry-After": str(exc.retry_after)} if exc.retry_after else None
