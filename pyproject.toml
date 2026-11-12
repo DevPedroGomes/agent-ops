@@ -1,41 +1,45 @@
 [build-system]
-# 77 e a primeira serie do setuptools com PEP 639: `license` como expressao
-# SPDX e `license-files`. Abaixo disso, `license = "MIT"` nao e aceito.
+# 77 is the first setuptools series with PEP 639 license expressions.
 requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "agent-ops"
-version = "0.3.0"
-description = "Operational primitives for LLM agents in production: a spend cap that fails closed, an append-only decision trail and a durable job queue."
+name = "pennyguard"
+version = "0.4.0"
+description = "Hard dollar budgets for LLM calls, enforced atomically across every worker and replica."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Pedro Gomes" }]
-requires-python = ">=3.12"
-# Sem o classificador de licenca de proposito: com PEP 639 a expressao em
-# `license` substitui o "License :: OSI Approved :: MIT License", e o
-# setuptools recusa o build quando os dois aparecem juntos.
+requires-python = ">=3.11"
+keywords = ["llm", "budget", "cost", "spend-limit", "anthropic", "openai", "redis", "rate-limit"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Framework :: AsyncIO",
     "Typing :: Typed",
 ]
-dependencies = [
-    "redis>=5.0",
-    "arq>=0.26",
-    "sqlalchemy>=2.0.51",
-    "pydantic-settings>=2.0.0",
-]
+# The core has no dependencies. Redis and OpenTelemetry are opt-in.
+dependencies = []
 
 [project.optional-dependencies]
-# `psycopg` so para os testes de portabilidade: o pacote nao escolhe driver
-# para quem o consome, ele recebe uma Engine pronta.
-dev = ["pytest>=8.0", "psycopg[binary]>=3.1", "ruff>=0.6", "mypy>=1.11"]
+redis = ["redis>=5.0"]
+otel = ["opentelemetry-api>=1.20"]
+dev = [
+    "pytest>=8.0",
+    "redis>=5.0",
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    "ruff>=0.9",
+    "mypy>=1.11",
+]
 
 [project.urls]
-Homepage = "https://portfolio.pgdev.com.br/en/projects/agent-ops"
 Repository = "https://github.com/DevPedroGomes/agent-ops"
 Changelog = "https://github.com/DevPedroGomes/agent-ops/blob/main/CHANGELOG.md"
 Issues = "https://github.com/DevPedroGomes/agent-ops/issues"
@@ -44,61 +48,34 @@ Issues = "https://github.com/DevPedroGomes/agent-ops/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-# `py.typed` e o que faz as anotacoes atravessarem para quem consome (PEP 561).
-# Sem ele o pacote instalado e opaco: o mypy do consumidor trata tudo como Any
-# e as assinaturas daqui nao valem nada do outro lado.
-"agent_ops" = ["py.typed"]
-"agent_ops.decisions" = ["*.sql"]
-"agent_ops.queue" = ["*.sql"]
+pennyguard = ["py.typed"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py312"
+target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RUF", "TRY", "BLE", "DTZ", "PT"]
 ignore = [
-    # `__all__` agrupado por modulo e por assunto em vez de alfabetico. A ordem
-    # conta o que o subpacote oferece, e ordenar apaga essa informacao.
-    "RUF022",
-    # `except Exception` e o contrato, nao um descuido. `registrar`, `marcar`,
-    # `ler`, `devolver`, `panorama` e `fechar` prometem nunca levantar, e cada
-    # um desses blocos tem comentario dizendo por que. Estreitar os tipos
-    # deixaria o contrato valer so para os erros que alguem ja imaginou.
+    # Settle, release and the event hook catch everything on purpose: once a
+    # call is paid for, no backend error may turn the response into a failure.
     "BLE001",
-    # O TIPO da excecao vai na mensagem de proposito, nao so no traceback
-    # anexado: varios formatadores de producao nao imprimem traceback, e ai
-    # "no such table" (permanente) e "connection reset" (passageiro) viram a
-    # mesma linha para quem opera. Ver o comentario no `marcar`.
-    "TRY400", "TRY401",
-    # Mensagem de excecao escrita na hora, com o valor recebido dentro. Extrair
-    # para constante afastaria a explicacao do lugar onde ela importa.
+    # Exception messages carry the offending value inline.
     "TRY003",
-    # `raise ... from exc` ja e usado onde a origem importa. Nos pontos onde
-    # nao esta, a excecao original nao acrescenta nada ao chamador.
     "TRY300",
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = [
-    # Um `datetime` ingenuo e o INSUMO do teste: ele existe para fazer o
-    # `json.dumps` levantar e provar que `registrar` nao derruba o chamador.
-    "DTZ001",
-    # `ValueError` e uma classe deliberada aqui: e o sinal de erro de
-    # PROGRAMACAO, separado das excecoes de dominio (`TetoAtingido`,
-    # `FilaCheia`) justamente para nao se confundir com elas. O tipo e o
-    # contrato. Onde a mesma funcao valida mais de uma coisa, os testes usam
-    # `match=` mesmo assim; exigir `match` em todos acoplaria a suite a
-    # redacoes que os docstrings mantem longas de proposito.
-    "PT011",
-]
+"tests/*" = ["PT011"]
 
 [tool.mypy]
-python_version = "3.12"
-files = ["src/agent_ops"]
+python_version = "3.11"
+files = ["src/pennyguard"]
 strict = true
-# O `arq` nao publica `py.typed`, entao os simbolos dele chegam como Any.
+
 [[tool.mypy.overrides]]
-module = ["arq.*"]
+module = ["opentelemetry.*"]
 ignore_missing_imports = true

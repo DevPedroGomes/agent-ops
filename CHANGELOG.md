@@ -1,11 +1,102 @@
 # Changelog
 
-Tag-pinned installs are the only supported way to consume this package, so
-every entry here is something that changes what a pinned upgrade does to you.
+The package is installed from git, pinned to a tag or a commit, so every
+entry here is something that changes what moving that pin does to you.
 
-## [Unreleased]
+## 0.4.0 (unreleased): pennyguard
 
-No change to runtime behavior. The version stays 0.3.0 until a release is cut.
+A new package in this repository. `agent-ops` is renamed `pennyguard` and
+rebuilt around one job: hard dollar budgets for LLM calls, shared by every
+process of an application. **Nothing from `agent_ops` is importable from this
+version.** Applications using `agent_ops.metering`, `agent_ops.decisions` or
+`agent_ops.queue` stay pinned to `v0.3.0`, which keeps working unchanged.
+
+### Why
+
+The three `agent_ops` subpackages solved unrelated problems (a call counter, an
+audit table, a wrapper over arq), and the counter, the only part specific to
+LLM spend, counted abstract units per day: it could not cap dollars, per-tenant
+spend or a month. The decision trail stored `cost_cents` as an integer, which
+rounds a typical small-model call to zero. The queue wrapped arq, which is in
+maintenance-only mode.
+
+### Added
+
+* `Guard` (async) and `SyncGuard`: reserve an estimate before a call and
+  settle the real cost after it. `call()` does both around one provider
+  call, and releases the reservation when the provider refused the call.
+  `call(retries=N)` retries what the SDKs would (408, 409, 429, 5xx,
+  timeouts), honoring `retry-after`, with a reservation per attempt, so a
+  429 is refunded and a timeout keeps its estimate. `retries` is a reserved
+  name for budget dimensions.
+* `Budget`: a dollar limit over an `hour`, `day`, `month` or `total` UTC
+  window, global or `per` a dimension such as tenant or user. A reservation is
+  checked against every applicable budget and charged to all of them, or to
+  none, in one Redis Lua script.
+* `RedisStore` and `AsyncRedisStore` over a client you pass in, Redis Cluster
+  compatible through a per-project hash tag. `MemoryStore` for tests and
+  single-process apps.
+* `Pricing` and `Price`: prices per million tokens, cache read and write
+  prices, long-context tiers, rate variants (fast mode, priority, flex) with
+  tiers of their own, and audio token prices. `Pricing.from_litellm` loads
+  LiteLLM's community price table, tiers and variants included; a price an
+  entry leaves out for a tier or variant is scaled up from the standard one.
+  Versioned model names resolve to their base entry; different models never
+  match by prefix. A call at a rate, prompt size or modality with no price
+  keeps its estimate instead of being billed as standard text.
+* `Usage` readers for Anthropic Messages, OpenAI Chat Completions and OpenAI
+  Responses, without importing either SDK, with audio tokens split out.
+  `Usage.all_from_response` prices every attempt of an Anthropic response
+  served by a refusal fallback, under each attempt's own model, and refuses
+  to guess the model of an attempt that names none when more than one ran.
+* A kill switch stored in Redis and checked inside the reservation script:
+  `guard.kill(reason)` stops every process at once, with no restart.
+* `guard.status()` for health endpoints, an `on_event` hook for every
+  reservation, refusal and settlement, and `pennyguard.otel.metrics_hook` for
+  OpenTelemetry metrics.
+* `fail_open=True` for applications that prefer availability to the cap when
+  Redis is down, reported as an `unchecked` event and the
+  `pennyguard.unchecked` metric rather than as a refusal. The default still
+  refuses.
+* Idempotent reservations. Each one has a marker key recording what it has
+  charged: running the reservation script twice charges once, and settling
+  moves the charge to a target instead of by a delta. A retried command, a
+  reply lost after the script ran, and `fail_open` all converge on the real
+  cost. `reservation_ttl` (six hours, an int of seconds) bounds how long a
+  reservation stays settleable. The scripts write the marker before moving
+  any counter, so a rejected write charges nothing.
+* A failed call releases its reservation only when the Anthropic or OpenAI
+  SDK raises its HTTP error status on its first attempt. Timeouts, dropped
+  streams, client disconnects, calls the SDK retried and errors raised by
+  your own code, even ones that carry an HTTP status, keep the estimate,
+  since the provider may already have billed.
+* Cancellation-safe writes in `Guard`: a settle or release cancelled in
+  flight (a client disconnecting from an ASGI app) finishes in the
+  background, and a reservation cancelled before its reply is refunded.
+* Counter keys include the budget's dimension, and `RedisStore` and
+  `AsyncRedisStore` refuse a client of the wrong kind.
+* One-hour cache writes priced separately (`Usage.cache_write_1h_tokens`,
+  `Price.cache_write_1h_per_mtok`), read from Anthropic's `cache_creation`
+  breakdown and LiteLLM's `*_above_1hr` field.
+* Examples: an offline quickstart and a FastAPI app with per-tenant limits on
+  Claude calls. Reference material lives in `docs/pricing.md` and
+  `docs/production.md`, so the README stays an overview.
+
+### Removed
+
+* `agent_ops.metering`, `agent_ops.decisions`, `agent_ops.queue`,
+  `agent_ops.config` and `agent_ops.tempo`, with their PostgreSQL schemas and
+  the `sqlalchemy`, `arq` and `pydantic-settings` dependencies. The core now
+  has no dependencies; `redis` and `opentelemetry-api` are extras.
+* `docs/how-it-was-built.md`, which described the removed code.
+
+### Changed
+
+* Python 3.11 or newer, down from 3.12. CI runs 3.11, 3.12 and 3.13.
+
+## agent-ops, after 0.3.0 (folded into 0.4.0, never tagged)
+
+No change to runtime behavior.
 
 ### Added
 

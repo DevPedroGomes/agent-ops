@@ -6,37 +6,15 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
 
-    # A suite roda em SQLite e nao precisa deste servico para passar: os testes
-    # de Postgres dao skip sem a variavel. Ele esta aqui porque as duas
-    # garantias que o pacote faz sobre o banco ("o mesmo DDL roda nos dois" e
-    # "o carimbo e UTC") sao justamente as que o SQLite nao consegue exercitar.
-    # A segunda escapou ate aparecer um Postgres de verdade com fuso proprio.
+    # The in-process suite cannot run the Lua scripts or exercise concurrency
+    # across clients. These are the guarantees the package exists for, so the
+    # Redis tests run here on every Python version.
     services:
-      postgres:
-        image: postgres:17-alpine
-        env:
-          POSTGRES_USER: agentops
-          POSTGRES_PASSWORD: agentops
-          POSTGRES_DB: agentops
-          # ATENCAO: nao troque por UTC. A imagem oficial sobe em UTC, e em UTC
-          # o defeito que estes testes perseguem NAO aparece: `CURRENT_TIMESTAMP`
-          # coincide com o UTC e tudo fica verde por acidente. O fuso com offset
-          # e o que da ao teste a chance de falhar. Os testes fixam o fuso da
-          # sessao tambem, entao isto e cinto e suspensorio.
-          TZ: America/Bahia
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U agentops"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
-
-      # O dublê de Redis nao executa Lua, e a reserva de cota e um script Lua.
-      # O que roda na suite rapida e um MODELO da semantica dele; aqui roda o
-      # script. E so contra um servidor de verdade da para exercitar
-      # concorrencia: com reserva nao atomica, 50 chamadas simultaneas passam
-      # num teto de 10, e nenhum teste sequencial percebe isso.
       redis:
         image: redis:8-alpine
         ports: ["6379:6379"]
@@ -46,89 +24,67 @@ jobs:
           --health-timeout 5s
           --health-retries 10
 
+    env:
+      PENNYGUARD_TEST_REDIS_URL: redis://localhost:6379/15
+
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ matrix.python }}" }
       - run: pip install -e ".[dev]"
-      - name: suite completa, com Postgres e Redis de verdade
-        env:
-          AGENT_OPS_TEST_POSTGRES_URL: postgresql+psycopg://agentops:agentops@localhost:5432/agentops
-          AGENT_OPS_TEST_REDIS_URL: redis://localhost:6379/15
-        run: python -m pytest tests/ -v
-      - name: nenhum teste de infraestrutura pode ter dado skip
-        # Um erro de digitacao no nome das variaveis acima transforma a
-        # cobertura de Postgres e de Redis em skip, e o job segue verde
-        # reportando exatamente o que reportava antes de os servicos
-        # existirem. Um skip aqui tem que ser vermelho.
-        env:
-          AGENT_OPS_TEST_POSTGRES_URL: postgresql+psycopg://agentops:agentops@localhost:5432/agentops
-          AGENT_OPS_TEST_REDIS_URL: redis://localhost:6379/15
+      - name: tests, with a real Redis
+        run: python -m pytest -v -rs
+      - name: no Redis test may be skipped
+        # A typo in the variable name above would turn every Redis test into
+        # a skip, and the job would stay green.
         run: |
           set -o pipefail
-          python -m pytest tests/test_portabilidade_postgres.py \
-            tests/test_portabilidade_redis.py -q --no-header | tee resultado.txt
-          if grep -q "skipped" resultado.txt; then
-            echo "::error::testes de infraestrutura deram skip: os servicos nao foram exercitados"
+          python -m pytest tests/test_redis.py -q --no-header -rs | tee result.txt
+          if grep -q "skipped" result.txt; then
+            echo "::error::Redis tests were skipped"
             exit 1
           fi
 
-  estatica:
+  static:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "3.11" }
       - run: pip install -e ".[dev]"
-      - run: ruff check src/ tests/
-      - name: mypy em strict
-        # Strict vale a pena num pacote que outros importam: sem ele as
-        # anotacoes existem para quem le e nao para quem chama, e o `py.typed`
-        # passaria a exportar promessas que ninguem verifica.
-        run: mypy
+      - run: ruff check src tests examples
+      - run: ruff format --check src tests examples
+      - run: mypy
 
-  # `pip install -e` resolve os dois `.sql` a partir da arvore de fontes de
-  # qualquer jeito, entao o job acima NAO prova que eles viajam dentro do
-  # artefato — ele passaria verde com o `package-data` do pyproject.toml
-  # apagado, e o `pip install "git+https://...@<tag>"` (a forma de instalar
-  # documentada no README, ja que o pacote nao esta no PyPI) quebraria com
-  # FileNotFoundError no boot da app. Este job constroi a
-  # wheel e a instala num venv limpo, fora da arvore de fontes, que e onde a
-  # diferenca aparece.
+  # An editable install resolves package data from the source tree, so only
+  # an installed wheel proves py.typed ships and that the core imports with
+  # no optional dependency present.
   wheel:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "3.11" }
       - run: pip install build
       - run: python -m build --wheel --outdir dist/
-      - run: python -m venv /tmp/venv-limpo
-      - run: /tmp/venv-limpo/bin/pip install dist/*.whl
-      - name: os .sql viajaram dentro da wheel
-        # Fora da arvore de fontes de proposito: aqui `import agent_ops` so
-        # pode resolver pelo pacote instalado.
+      - run: python -m venv /tmp/clean
+      - run: /tmp/clean/bin/pip install dist/*.whl
+      - name: the bare wheel imports and runs without extras
         working-directory: /tmp
         run: |
-          /tmp/venv-limpo/bin/python - <<'PY'
-          import agent_ops
-          from agent_ops.decisions import migracao
-          from agent_ops.queue import execucao
-          import agent_ops.metering
-
-          assert migracao.SQL_SCHEMA.strip(), "schema.sql chegou vazio na wheel"
-          assert execucao.SQL_SCHEMA.strip(), "progresso.sql chegou vazio na wheel"
-          assert "CREATE TABLE IF NOT EXISTS decisions" in migracao.SQL_SCHEMA
-          assert "CREATE TABLE IF NOT EXISTS job_progress" in execucao.SQL_SCHEMA
-
-          # O py.typed tem que viajar junto, senao o pacote chega opaco: o
-          # mypy de quem consome trata tudo como Any e as anotacoes nao valem
-          # nada do outro lado. Mesma classe de defeito dos .sql acima, e
-          # invisivel do mesmo jeito num install editavel.
+          /tmp/clean/bin/python - <<'PY'
+          import sys
           from importlib import resources
-          assert resources.files("agent_ops").joinpath("py.typed").is_file(), \
-              "py.typed nao chegou na wheel"
-          print("ok", agent_ops.__version__)
+
+          import pennyguard
+          from pennyguard import Budget, MemoryStore, SyncGuard
+
+          assert "redis" not in sys.modules
+          assert resources.files("pennyguard").joinpath("py.typed").is_file()
+          guard = SyncGuard(MemoryStore(), [Budget("g", 1)])
+          guard.reserve("0.5").settle("0.25")
+          assert guard.status()[0].spent_usd == 0.25
+          print("ok", pennyguard.__version__)
           PY
